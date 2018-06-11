@@ -2,7 +2,9 @@ package org.apache.spark.ml.fm
 
 import scala.collection.mutable
 
+import org.apache.spark.ml._
 import org.apache.spark.ml.param._
+import org.apache.spark.ml.util._
 import org.apache.spark.sql._
 import org.apache.spark.sql.expressions._
 import org.apache.spark.sql.types._
@@ -14,151 +16,121 @@ class DistributedFM extends FM {
 
   override val uid: String = "distributed_fm"
 
-  override def fit(df: DataFrame): FMModel = ???
+  override def copy(extra: ParamMap): Params = ???
 
-  override def copy(extra: ParamMap): LocalFM = defaultCopy(extra)
+  override def fit(dataset: Dataset[_]): DistributedFMModel = {
+    import Utils._
+
+    val spark = dataset.sparkSession
+    import spark.implicits._
+
+    var (intercept, model) =
+      if (isSet(initModelPath) && getInitModelPath.nonEmpty) {
+        val m: DistributedFMModel = DistributedFMModel.load(getInitModelPath)
+        (m.intercept, m.model)
+
+      } else {
+        val numFeatures = dataset.select(getIndiceCol)
+          .as[Array[Long]].rdd
+          .map { indices =>
+            if (indices.nonEmpty) {
+              indices.last
+            } else {
+              0L
+            }
+          }.max()
+
+        (0.0,
+          spark.range(numFeatures).toDF(INDEX)
+            .withColumn(WEIGHT, lit(0.0))
+            .withColumn(FACTOR, array(Array.range(0, getRank).map(i => randn(getSeed + i)): _*)))
+      }
+
+
+    val checkpointer = new Checkpointer[Row](spark.sparkContext, getCheckpointInterval,
+      StorageLevel.fromString(getIntermediateStorageLevel))
+
+    var modelRDD = model.rdd
+    var modelSchema = model.schema
+
+    var iter = 0
+    while (iter < getMaxIter) {
+      println(s"Iteration $iter")
+
+      {
+        println(s"update itercept")
+        intercept = DistributedFM.updateIntercept(dataset.toDF, intercept, model, getRank, getRegI1, getRegI2)
+      }
+
+
+      {
+        model = model.select(INDEX, WEIGHT, FACTOR)
+          .sort(INDEX)
+          .withColumn(RANDOM, (rand(getSeed + iter) * getNumRandGroups).cast(IntegerType))
+
+        var group = 0
+        while (group < getNumRandGroups) {
+          println(s"update weights $group")
+
+          val selModel = model.withColumn(SELECTED,
+            when(col(RANDOM).equalTo(group), true).otherwise(false))
+
+          model = DistributedFM.updateWeights(dataset.toDF, intercept, selModel, getRank, getRegW1, getRegW2)
+
+          modelRDD = model.rdd
+          modelSchema = model.schema
+          checkpointer.update(modelRDD)
+          modelRDD.count()
+          model = spark.createDataFrame(modelRDD, modelSchema)
+
+          group += 1
+        }
+      }
+
+
+      {
+        model = model.select(INDEX, WEIGHT, FACTOR)
+          .sort(INDEX)
+          .withColumn(RANDOM, (rand(-getSeed - iter) * getNumRandGroups).cast(IntegerType))
+
+        var group = 0
+        while (group < getNumRandGroups) {
+          println(s"update factors $group")
+
+          val selModel = model.withColumn(SELECTED,
+            when(col(RANDOM).equalTo(group), true).otherwise(false))
+
+          model = DistributedFM.updateFactors(dataset.toDF, intercept, selModel, getRank, getRegV1, getRegV2, getRegVG, getMaxCCDIters)
+
+          modelRDD = model.rdd
+          modelSchema = model.schema
+          checkpointer.update(modelRDD)
+          modelRDD.count()
+          model = spark.createDataFrame(modelRDD, modelSchema)
+
+          group += 1
+        }
+      }
+
+      iter += 1
+    }
+
+    val finalModel = model.select(INDEX, WEIGHT, FACTOR)
+    finalModel.persist(StorageLevel.fromString(getFinalStorageLevel))
+    finalModel.count()
+
+    checkpointer.unpersistDataSet()
+    checkpointer.deleteAllCheckpoints()
+
+    new DistributedFMModel(uid, intercept, finalModel)
+  }
+
 }
 
 
 object DistributedFM extends Serializable {
 
   import Utils._
-
-
-  def train(input: DataFrame,
-            rank: Int,
-            maxIters: Int,
-            numFeatures: Long,
-            numGroups: Int,
-            regI1: Double,
-            regI2: Double,
-            regW1: Double,
-            regW2: Double,
-            regV1: Double,
-            regV2: Double,
-            regVG: Double,
-            ccdIters: Int,
-            std: Double,
-            seed: Long,
-            checkpointPath: String,
-            initialIntercept: Option[Double],
-            initialModel: Option[DataFrame]): (Double, DataFrame) = {
-    val spark = input.sparkSession
-
-    var intercept: Double = initialIntercept.getOrElse(0.0)
-    var model = initialModel.getOrElse {
-      spark.range(numFeatures).toDF(INDEX)
-        .withColumn(WEIGHT, lit(0.0))
-        .withColumn(FACTOR, array(Array.range(0, rank).map(i => randn(seed + i)): _*))
-    }
-
-    var modelRDD = model.rdd
-    var modelSchema = model.schema
-    val modelCheckpointer = new Checkpointer[Row](spark.sparkContext, 5, StorageLevel.MEMORY_AND_DISK)
-
-    model.show()
-
-    //    var iCheck = 0
-
-    var iter = 0
-    while (iter < maxIters) {
-      println(s"Iteration $iter")
-
-      {
-        println(s"update itercept")
-        intercept = updateIntercept(input, intercept, model, rank, regI1, regI2)
-      }
-
-
-      {
-        model = model.select(INDEX, WEIGHT, FACTOR)
-          .sort(INDEX)
-          .withColumn(RANDOM, (rand(seed + iter) * numGroups).cast(IntegerType))
-        modelSchema = model.schema
-
-        modelRDD = model.rdd
-        modelCheckpointer.update(modelRDD)
-        modelRDD.count()
-        model = spark.createDataFrame(modelRDD, modelSchema)
-
-
-        var group = 0
-        while (group < numGroups) {
-          println(s"update weights $group")
-
-          val selModel = model.withColumn(SELECTED,
-            when(col(RANDOM).equalTo(group), true).otherwise(false))
-
-          model = updateWeights(input, intercept, selModel, rank, regW1, regW2)
-          modelSchema = model.schema
-
-          modelRDD = model.rdd
-          modelCheckpointer.update(modelRDD)
-          modelRDD.count()
-          model = spark.createDataFrame(modelRDD, modelSchema)
-
-          //          val path = s"${checkpointPath}/${iCheck}"
-          //          iCheck += 1
-          //          model.write
-          //            .mode(SaveMode.Overwrite)
-          //            .parquet(path)
-          //          model = spark.read.parquet(path)
-
-          group += 1
-        }
-      }
-
-
-      {
-        model = model.select(INDEX, WEIGHT, FACTOR)
-          .sort(INDEX)
-          .withColumn(RANDOM, (rand(-seed - iter) * numGroups).cast(IntegerType))
-
-
-        //        val path = s"${checkpointPath}/${iCheck}"
-        //        iCheck += 1
-        //        model.select(INDEX, WEIGHT, FACTOR)
-        //          .sort(INDEX)
-        //          .withColumn(RANDOM, (rand(-seed - iter) * numGroups).cast(IntegerType))
-        //          .write
-        //          .mode(SaveMode.Overwrite)
-        //          .parquet(path)
-        //        model = spark.read.parquet(path)
-
-        var group = 0
-        while (group < numGroups) {
-          println(s"update factors $group")
-
-          val selModel = model.withColumn(SELECTED,
-            when(col(RANDOM).equalTo(group), true).otherwise(false))
-
-          model = updateFactors(input, intercept, selModel, rank, regV1, regV2, regVG, ccdIters)
-          modelSchema = model.schema
-
-          modelRDD = model.rdd
-          modelCheckpointer.update(modelRDD)
-          modelRDD.count()
-          model = spark.createDataFrame(modelRDD, modelSchema)
-
-
-          //          val path = s"${checkpointPath}/${iCheck}"
-          //          iCheck += 1
-          //          model.write
-          //            .mode(SaveMode.Overwrite)
-          //            .parquet(path)
-          //          model = spark.read.parquet(path)
-
-          group += 1
-        }
-      }
-
-
-      iter += 1
-    }
-
-    (intercept, model.select(INDEX, WEIGHT, FACTOR))
-  }
-
 
   /**
     * input
@@ -340,17 +312,22 @@ object DistributedFM extends Serializable {
     val spark = input.sparkSession
     import spark.implicits._
 
-    val arrayNonEmptyUDF = udf { array: Seq[_] => array.nonEmpty }
     val predUDAF = new predictWithDotsUDAF(rank, intercept)
 
     input.select(INSTANCE_INDEX, INSTANCE_LABEL, INSTANCE_WEIGHT, INDICES, VALUES)
       .as[(Long, Double, Double, Array[Long], Array[Double])]
       .flatMap { case (instanceIndex, instanceLabel, instanceWeight, indices, values) =>
+        var first = true
         indices.iterator
           .zip(values.iterator)
           .filter(t => t._2 != 0)
           .map { case (index, value) =>
-            (instanceIndex, instanceLabel, instanceWeight, index, value, indices, values)
+            if (first) {
+              first = false
+              (instanceIndex, instanceLabel, instanceWeight, index, value, indices, values)
+            } else {
+              (instanceIndex, instanceLabel, instanceWeight, index, value, null, null)
+            }
           }
       }.toDF(INSTANCE_INDEX, INSTANCE_LABEL, INSTANCE_WEIGHT, INDEX, VALUE, INDICES, VALUES)
 
@@ -359,8 +336,8 @@ object DistributedFM extends Serializable {
       .groupBy(INSTANCE_INDEX)
       .agg(first(INSTANCE_LABEL).as(INSTANCE_LABEL),
         first(INSTANCE_WEIGHT).as(INSTANCE_WEIGHT),
-        first(col(INDICES)).as(INDICES),
-        first(col(VALUES)).as(VALUES),
+        first(col(INDICES), true).as(INDICES),
+        first(col(VALUES), true).as(VALUES),
         collect_list(when(col(SELECTED), col(INDEX))).as(SELECTED_INDICES),
         predUDAF(col(VALUE), col(WEIGHT), col(FACTOR)).as(PREDICTION_DOTS))
       .select(INSTANCE_LABEL, INSTANCE_WEIGHT, INDICES, VALUES, SELECTED_INDICES, PREDICTION_DOTS)
@@ -649,5 +626,40 @@ class ProblemStatUDAF(val k: Int) extends UserDefinedAggregateFunction {
     buffer.getSeq[Double](0)
   }
 }
+
+
+class DistributedFMModel private[ml](override val uid: String,
+                                     val intercept: Double,
+                                     @transient val model: DataFrame)
+  extends Model[DistributedFMModel] with FMParams with FMModel with MLWritable {
+
+
+  override def transform(dataset: Dataset[_]): DataFrame = {
+
+
+    ???
+  }
+
+  override def copy(extra: ParamMap): DistributedFMModel = ???
+
+  override def write: MLWriter = ???
+
+  override def transformSchema(schema: StructType): StructType = ???
+
+  override def toLocal: FMModel = ???
+
+  override def toDistributed: FMModel = this
+
+  override def isDistributed: Boolean = true
+}
+
+
+object DistributedFMModel extends MLReadable[DistributedFMModel] {
+  override def read: MLReader[DistributedFMModel] = ???
+
+  override def load(path: String): DistributedFMModel = super.load(path)
+}
+
+
 
 

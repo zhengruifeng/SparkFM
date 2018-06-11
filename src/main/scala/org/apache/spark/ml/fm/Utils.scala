@@ -289,6 +289,14 @@ private[fm] object Utils extends Logging {
       Double.NaN
     }
   }
+
+
+  def truncate(df: DataFrame): DataFrame = {
+    val spark = df.sparkSession
+    val rdd = df.rdd
+    val schema = df.schema
+    spark.createDataFrame(rdd, schema)
+  }
 }
 
 

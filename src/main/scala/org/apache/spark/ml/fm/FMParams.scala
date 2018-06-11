@@ -6,120 +6,213 @@ import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.storage.StorageLevel
 
-private[fm] trait FMParams extends Params with HasLabelCol with HasWeightCol with HasFeaturesCol
-  with HasFitIntercept with HasRegParam with HasElasticNetParam with HasMaxIter with HasSeed
-  with HasCheckpointInterval {
+
+private[fm] trait FMParams extends Params
+  with HasMaxIter with HasRegParam with HasPredictionCol with HasCheckpointInterval with HasSeed {
 
   /**
-    * The length of factor vectors.
-    * (default = 4)
+    * Param for the column name for non-zero feature indices.
+    * Default: "indices"
+    * @group param
     */
-  final val k = new IntParam(this, "rank",
-    "The length of factor vectors. (> 0)", ParamValidators.gt(0))
+  val indiceCol = new Param[String](this, "indiceCol", "column name for non-zero feature indices")
 
-  def getRank: Int = $(k)
-
-  setDefault(k -> 4)
+  /** @group getParam */
+  def getIndiceCol: String = $(indiceCol)
 
 
   /**
-    * Std for initialization of factors.
-    * (default = 0.1)
+    * Param for the column name for non-zero feature values.
+    * Default: "values"
+    * @group param
     */
-  final val initStd = new DoubleParam(this, "initStd",
-    "Std for initialization of factors. (> 0)", ParamValidators.gt(0))
+  val valuesCol = new Param[String](this, "valuesCol", "column name for non-zero feature values")
 
-  def getInitStd: Double = $(initStd)
-
-  setDefault(initStd -> 0.1)
+  /** @group getParam */
+  def getValuesCol: String = $(valuesCol)
 
 
   /**
-    * Group regularization parameter of factors.
-    * (default = 0.0)
+    * Param for rank of the factorization machine (positive).
+    * Default: 8
+    *
+    * @group param
     */
-  final val regFactor = new DoubleParam(this, "regFactor",
-    "Group regularization parameter of factors. (>= 0)", ParamValidators.gtEq(0))
+  val rank = new IntParam(this, "rank", "rank of the factorization machine", ParamValidators.gtEq(1))
 
-  def getRegFactor: Double = $(regFactor)
+  /** @group getParam */
+  def getRank: Int = $(rank)
 
-  setDefault(regFactor -> 0.0)
+  setDefault(rank -> 8)
 
 
   /**
-    * Whether to fit weights.
-    * (default = true)
+    * Param for number of randomized groups (positive).
+    * Default: 10
+    *
+    * @group param
     */
-  final val fitWeights: BooleanParam = new BooleanParam(this, "fitWeights",
-    "Whether to fit weights")
+  val numRandGroups = new IntParam(this, "numRandGroups", "number of randomized groups", ParamValidators.gtEq(1))
 
-  def getFitWeights: Boolean = $(fitWeights)
+  /** @group getParam */
+  def getNumRandGroups: Int = $(numRandGroups)
 
-  setDefault(fitWeights, true)
+  setDefault(numRandGroups -> 10)
 
 
   /**
-    * Maximum number of iterations for each sub-problem.
-    * (default = 5)
+    * Param for L1-norm regularization of intercept.
+    * Default: 0.0
+    *
+    * @group param
     */
-  final val maxSubIters: IntParam = new IntParam(this, "maxSubIters",
-    "Maximum number of iterations for each sub-problem. (> 0)",
-    ParamValidators.gt(0))
+  val regI1 = new DoubleParam(this, "regI1", "L1-norm regularization of intercept", ParamValidators.gtEq(0))
 
-  def getMaxSubIters: Int = $(maxSubIters)
+  /** @group getParam */
+  def getRegI1: Double = $(regI1)
 
-  setDefault(maxSubIters, 5)
+  setDefault(regI1 -> 0.0)
 
 
   /**
-    * Orthogonal splits of feature space.
+    * Param for L2-norm regularization of intercept.
+    * Default: 0.0
+    *
+    * @group param
     */
-  final val splits: IntArrayParam = new IntArrayParam(this, "splits",
-    "Orthogonal splits of feature space.",
-    (arr: Array[Int]) => {
-      arr.nonEmpty &&
-        arr.forall(_ >= 0) &&
-        arr.distinct.length == arr.length &&
-        (0 until arr.length - 1).forall { i => arr(i) < arr(i + 1) }
-    })
+  val regI2 = new DoubleParam(this, "regI2", "L2-norm regularization of intercept", ParamValidators.gtEq(0))
 
-  def getSplits: Array[Int] = $(splits)
+  /** @group getParam */
+  def getRegI2: Double = $(regI2)
+
+  setDefault(regI2 -> 0.0)
 
 
   /**
-    * StorageLevel for intermediate datasets. Cannot be "NONE".
-    * (default = "MEMORY_AND_DISK")
+    * Param for L1-norm regularization of linear weights.
+    * Default: 0.0
+    *
+    * @group param
+    */
+  val regW1 = new DoubleParam(this, "regW1", "L1-norm regularization of linear weights", ParamValidators.gtEq(0))
+
+  /** @group getParam */
+  def getRegW1: Double = $(regW1)
+
+  setDefault(regW1 -> 0.0)
+
+
+  /**
+    * Param for L2-norm regularization of linear weights.
+    * Default: 0.0
+    *
+    * @group param
+    */
+  val regW2 = new DoubleParam(this, "regW2", "L2-norm regularization of linear weights", ParamValidators.gtEq(0))
+
+  /** @group getParam */
+  def getRegW2: Double = $(regW2)
+
+  setDefault(regW2 -> 0.0)
+
+
+  /**
+    * Param for L1-norm regularization of factors.
+    * Default: 0.0
+    *
+    * @group param
+    */
+  val regV1 = new DoubleParam(this, "regV1", "L1-norm regularization of factors", ParamValidators.gtEq(0))
+
+  /** @group getParam */
+  def getRegV1: Double = $(regV1)
+
+  setDefault(regV1 -> 0.0)
+
+
+  /**
+    * Param for L2-norm regularization of factors.
+    * Default: 0.0
+    *
+    * @group param
+    */
+  val regV2 = new DoubleParam(this, "regV2", "L2-norm regularization of factors", ParamValidators.gtEq(0))
+
+  /** @group getParam */
+  def getRegV2: Double = $(regV2)
+
+  setDefault(regV2 -> 0.0)
+
+
+  /**
+    * Param for L2-norm regularization of factor-groups.
+    * Default: 0.0
+    *
+    * @group param
+    */
+  val regVG = new DoubleParam(this, "regVG", "L2-norm regularization of factor-groups", ParamValidators.gtEq(0))
+
+  /** @group getParam */
+  def getRegVG: Double = $(regVG)
+
+  setDefault(regVG -> 0.0)
+
+
+  /**
+    * Param for maximum iterations in base CCD solver.
+    * Default: 5
+    *
+    * @group param
+    */
+  val maxCCDIters = new IntParam(this, "maxCCDIters", "maximum iterations in base CCD solver", ParamValidators.gtEq(5))
+
+  /** @group getParam */
+  def getMaxCCDIters: Int = $(maxCCDIters)
+
+  setDefault(maxCCDIters -> 5)
+
+
+  /**
+    * Param for StorageLevel for intermediate datasets. Pass in a string representation of
+    * `StorageLevel`. Cannot be "NONE".
+    * Default: "MEMORY_AND_DISK".
+    *
+    * @group expertParam
     */
   val intermediateStorageLevel = new Param[String](this, "intermediateStorageLevel",
     "StorageLevel for intermediate datasets. Cannot be 'NONE'.",
     (s: String) => Try(StorageLevel.fromString(s)).isSuccess && s != "NONE")
 
+  /** @group expertGetParam */
   def getIntermediateStorageLevel: String = $(intermediateStorageLevel)
 
   setDefault(intermediateStorageLevel -> "MEMORY_AND_DISK")
 
 
   /**
-    * Minimum size of orthogonal group for pre-sorting.
-    * (default = 4096)
+    * Param for StorageLevel for ALS model factors. Pass in a string representation of
+    * `StorageLevel`.
+    * Default: "MEMORY_AND_DISK".
+    *
+    * @group expertParam
     */
-  val minSortedGroup = new IntParam(this, "minSortedGroup",
-    "Minimum size of orthogonal group for pre-sorting. (> 0)",
-    ParamValidators.gt(0))
+  val finalStorageLevel = new Param[String](this, "finalStorageLevel",
+    "StorageLevel for ALS model factors.",
+    (s: String) => Try(StorageLevel.fromString(s)).isSuccess)
 
-  def getMinSortedGroup: Int = $(minSortedGroup)
+  /** @group expertGetParam */
+  def getFinalStorageLevel: String = $(finalStorageLevel)
 
-  setDefault(minSortedGroup -> 4096)
+  setDefault(finalStorageLevel -> "MEMORY_AND_DISK")
 
 
   /**
-    * Whether to treat the model as a distributed one..
-    * (default = false)
+    * Param for initial model path
+    *
+    * @group expertParam
     */
-  final val distributed = new BooleanParam(this, "distributed",
-    "Whether to treat the model as a distributed one.")
+  val initModelPath = new Param[String](this, "initModelPath", "initial model path")
 
-  def getDistributed: Boolean = $(distributed)
-
-  setDefault(distributed -> false)
+  /** @group expertGetParam */
+  def getInitModelPath: String = $(initModelPath)
 }
