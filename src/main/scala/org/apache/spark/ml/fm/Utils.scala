@@ -55,7 +55,6 @@ private[fm] object FromDouble {
 }
 
 
-
 private[fm] object Utils extends Logging {
 
   val INSTANCE_INDEX = "instance_index"
@@ -293,21 +292,51 @@ private[fm] object Utils extends Logging {
 }
 
 
-private[fm] class Checkpointer(val spark: SparkSession,
-                               val checkpointInterval: Int,
-                               val storageLevel: StorageLevel,
-                               val maxPersisted: Int) extends Logging {
-  def this(spark: SparkSession, checkpointInterval: Int, storageLevel: StorageLevel) =
-    this(spark, checkpointInterval, storageLevel, 2)
+/**
+  * This class helps with persisting and checkpointing RDDs.
+  *
+  * Specifically, this abstraction automatically handles persisting and (optionally) checkpointing,
+  * as well as unpersisting and removing checkpoint files.
+  *
+  * Users should call update() when a new Dataset has been created,
+  * before the Dataset has been materialized.  After updating [[Checkpointer]], users are
+  * responsible for materializing the Dataset to ensure that persisting and checkpointing actually
+  * occur.
+  *
+  * When update() is called, this does the following:
+  *  - Persist new Dataset (if not yet persisted), and put in queue of persisted Datasets.
+  *  - Unpersist Datasets from queue until there are at most 2 persisted Datasets.
+  *  - If using checkpointing and the checkpoint interval has been reached,
+  *     - Checkpoint the new Dataset, and put in a queue of checkpointed Datasets.
+  *     - Remove older checkpoints.
+  *
+  * WARNINGS:
+  *  - This class should NOT be copied (since copies may conflict on which Datasets should be
+  * checkpointed).
+  *  - This class removes checkpoint files once later Datasets have been checkpointed.
+  * However, references to the older Datasets will still return isCheckpointed = true.
+  *
+  * @param sc                 SparkContext for the Datasets given to this checkpointer
+  * @param checkpointInterval Datasets will be checkpointed at this interval.
+  *                           If this interval was set as -1, then checkpointing will be disabled.
+  * @param storageLevel       caching storageLevel
+  * @tparam T Dataset type, such as Double
+  */
+private[fm] class Checkpointer[T](val sc: SparkContext,
+                                  val checkpointInterval: Int,
+                                  val storageLevel: StorageLevel,
+                                  val maxPersisted: Int) extends Logging {
+  def this(sc: SparkContext, checkpointInterval: Int, storageLevel: StorageLevel) =
+    this(sc, checkpointInterval, storageLevel, 2)
 
   require(storageLevel != StorageLevel.NONE)
   require(maxPersisted > 1)
 
-  /** FIFO queue of past checkpointed Files */
-  private val checkpointQueue = mutable.Queue.empty[String]
+  /** FIFO queue of past checkpointed Datasets */
+  private val checkpointQueue = mutable.Queue.empty[RDD[T]]
 
   /** FIFO queue of past persisted Datasets */
-  private val persistedQueue = mutable.Queue.empty[DataFrame]
+  private val persistedQueue = mutable.Queue.empty[RDD[T]]
 
   /** Number of times [[update()]] has been called */
   private var updateCount = 0
@@ -317,60 +346,58 @@ private[fm] class Checkpointer(val spark: SparkSession,
     * Since this handles persistence and checkpointing, this should be called before the Dataset
     * has been materialized.
     *
-    * @param df New Dataset created from previous Datasets in the lineage.
+    * @param data New Dataset created from previous Datasets in the lineage.
     */
-  def update(df: DataFrame): DataFrame = {
-
+  def update(data: RDD[T]): Unit = {
+    persist(data)
+    persistedQueue.enqueue(data)
+    while (persistedQueue.length > maxPersisted) {
+      unpersist(persistedQueue.dequeue)
+    }
     updateCount += 1
 
+    // Handle checkpointing (after persisting)
     if (checkpointInterval != -1 && (updateCount % checkpointInterval) == 0
-      && spark.sparkContext.getCheckpointDir.nonEmpty) {
-
-      val file = s"${spark.sparkContext.getCheckpointDir.get}/$updateCount"
-      df.write.parquet(file)
-      val df2 = spark.read.parquet(file)
-
-      checkpointQueue.enqueue(file)
+      && sc.getCheckpointDir.nonEmpty) {
+      // Add new checkpoint before removing old checkpoints.
+      checkpoint(data)
+      checkpointQueue.enqueue(data)
       // Remove checkpoints before the latest one.
-      while (checkpointQueue.length > 1) {
+      var canDelete = true
+      while (checkpointQueue.length > 1 && canDelete) {
         // Delete the oldest checkpoint only if the next checkpoint exists.
-        removeCheckpointFile(checkpointQueue.dequeue)
+        if (isCheckpointed(checkpointQueue.head)) {
+          removeCheckpointFile(checkpointQueue.dequeue)
+        } else {
+          canDelete = false
+        }
       }
-
-      persist(df2)
-      persistedQueue.enqueue(df2)
-      while (persistedQueue.length > maxPersisted) {
-        unpersist(persistedQueue.dequeue)
-      }
-
-      df2
-
-    } else {
-
-      persist(df)
-      persistedQueue.enqueue(df)
-      while (persistedQueue.length > maxPersisted) {
-        unpersist(persistedQueue.dequeue)
-      }
-
-      df
     }
   }
 
+  /** Checkpoint the Dataset */
+  protected def checkpoint(data: RDD[T]): Unit = {
+    data.checkpoint()
+  }
+
+  /** Return true iff the Dataset is checkpointed */
+  protected def isCheckpointed(data: RDD[T]): Boolean = {
+    data.isCheckpointed
+  }
 
   /**
     * Persist the Dataset.
     * Note: This should handle checking the current [[StorageLevel]] of the Dataset.
     */
-  protected def persist(data: DataFrame): Unit = {
-    if (data.storageLevel == StorageLevel.NONE) {
+  protected def persist(data: RDD[T]): Unit = {
+    if (data.getStorageLevel == StorageLevel.NONE) {
       data.persist(storageLevel)
     }
   }
 
   /** Unpersist the Dataset */
-  protected def unpersist(data: DataFrame): Unit = {
-    data.unpersist(false)
+  protected def unpersist(data: RDD[T]): Unit = {
+    data.unpersist(blocking = false)
   }
 
   /** Call this to unpersist the Dataset. */
@@ -391,21 +418,23 @@ private[fm] class Checkpointer(val spark: SparkSession,
     * Dequeue the oldest checkpointed Dataset, and remove its checkpoint files.
     * This prints a warning but does not fail if the files cannot be removed.
     */
-  private def removeCheckpointFile(file: String): Unit = {
+  private def removeCheckpointFile(data: RDD[T]): Unit = {
     // Since the old checkpoint is not deleted by Spark, we manually delete it
-    Future {
-      val start = System.nanoTime
-      val path = new Path(file)
-      val fs = path.getFileSystem(spark.sparkContext.hadoopConfiguration)
-      fs.delete(path, true)
-      (System.nanoTime - start) / 1e9
+    data.getCheckpointFile.foreach { file =>
+      Future {
+        val start = System.nanoTime
+        val path = new Path(file)
+        val fs = path.getFileSystem(sc.hadoopConfiguration)
+        fs.delete(path, true)
+        (System.nanoTime - start) / 1e9
 
-    }.onComplete {
-      case Success(v) =>
-        logInfo(s"successfully remove old checkpoint file: $file, duration $v seconds")
+      }.onComplete {
+        case Success(v) =>
+          logInfo(s"successfully remove old checkpoint file: $file, duration $v seconds")
 
-      case Failure(t) =>
-        logWarning(s"fail to remove old checkpoint file: $file, ${t.toString}")
+        case Failure(t) =>
+          logWarning(s"fail to remove old checkpoint file: $file, ${t.toString}")
+      }
     }
   }
 }

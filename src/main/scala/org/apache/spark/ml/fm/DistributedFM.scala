@@ -3,7 +3,6 @@ package org.apache.spark.ml.fm
 import scala.collection.mutable
 
 import org.apache.spark.ml.param._
-import org.apache.spark.rdd._
 import org.apache.spark.sql._
 import org.apache.spark.sql.expressions._
 import org.apache.spark.sql.types._
@@ -53,9 +52,13 @@ object DistributedFM extends Serializable {
         .withColumn(FACTOR, array(Array.range(0, rank).map(i => randn(seed + i)): _*))
     }
 
+    var modelRDD = model.rdd
+    var modelSchema = model.schema
+    val modelCheckpointer = new Checkpointer[Row](spark.sparkContext, 5, StorageLevel.MEMORY_AND_DISK)
+
     model.show()
 
-    var iCheck = 0
+    //    var iCheck = 0
 
     var iter = 0
     while (iter < maxIters) {
@@ -71,16 +74,13 @@ object DistributedFM extends Serializable {
         model = model.select(INDEX, WEIGHT, FACTOR)
           .sort(INDEX)
           .withColumn(RANDOM, (rand(seed + iter) * numGroups).cast(IntegerType))
+        modelSchema = model.schema
 
-        //        val path = s"${checkpointPath}/${iCheck}"
-        //        iCheck += 1
-        //        model.select(INDEX, WEIGHT, FACTOR)
-        //          .sort(INDEX)
-        //          .withColumn(RANDOM, (rand(seed + iter) * numGroups).cast(IntegerType))
-        //          .write
-        //          .mode(SaveMode.Overwrite)
-        //          .parquet(path)
-        //        model = spark.read.parquet(path)
+        modelRDD = model.rdd
+        modelCheckpointer.update(modelRDD)
+        modelRDD.count()
+        model = spark.createDataFrame(modelRDD, modelSchema)
+
 
         var group = 0
         while (group < numGroups) {
@@ -90,13 +90,19 @@ object DistributedFM extends Serializable {
             when(col(RANDOM).equalTo(group), true).otherwise(false))
 
           model = updateWeights(input, intercept, selModel, rank, regW1, regW2)
+          modelSchema = model.schema
 
-          val path = s"${checkpointPath}/${iCheck}"
-          iCheck += 1
-          model.write
-            .mode(SaveMode.Overwrite)
-            .parquet(path)
-          model = spark.read.parquet(path)
+          modelRDD = model.rdd
+          modelCheckpointer.update(modelRDD)
+          modelRDD.count()
+          model = spark.createDataFrame(modelRDD, modelSchema)
+
+          //          val path = s"${checkpointPath}/${iCheck}"
+          //          iCheck += 1
+          //          model.write
+          //            .mode(SaveMode.Overwrite)
+          //            .parquet(path)
+          //          model = spark.read.parquet(path)
 
           group += 1
         }
@@ -127,13 +133,20 @@ object DistributedFM extends Serializable {
             when(col(RANDOM).equalTo(group), true).otherwise(false))
 
           model = updateFactors(input, intercept, selModel, rank, regV1, regV2, regVG, ccdIters)
+          modelSchema = model.schema
 
-          val path = s"${checkpointPath}/${iCheck}"
-          iCheck += 1
-          model.write
-            .mode(SaveMode.Overwrite)
-            .parquet(path)
-          model = spark.read.parquet(path)
+          modelRDD = model.rdd
+          modelCheckpointer.update(modelRDD)
+          modelRDD.count()
+          model = spark.createDataFrame(modelRDD, modelSchema)
+
+
+          //          val path = s"${checkpointPath}/${iCheck}"
+          //          iCheck += 1
+          //          model.write
+          //            .mode(SaveMode.Overwrite)
+          //            .parquet(path)
+          //          model = spark.read.parquet(path)
 
           group += 1
         }
