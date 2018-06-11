@@ -24,6 +24,23 @@ class DistributedFM extends FM {
     val spark = dataset.sparkSession
     import spark.implicits._
 
+    val wCol = if (isSet(weightCol) && getWeightCol.nonEmpty) {
+      col(getWeightCol)
+    } else {
+      lit(1.0)
+    }
+
+    val input = dataset.select(col(getIndiceCol), col(getValuesCol),
+      col(getLabelCol).cast(DoubleType), wCol.cast(DoubleType))
+      .as[(Array[Long], Array[Double], Double, Double)].rdd
+      .zipWithUniqueId()
+      .map { case ((indices, values, instanceLabel, instanceWeight), instanceIndex) =>
+        require(indices.length == values.length)
+        require(instanceWeight >= 0)
+        (indices, values, instanceLabel, instanceWeight, instanceIndex)
+      }.toDF(INDICES, VALUES, INSTANCE_LABEL, INSTANCE_WEIGHT, INSTANCE_INDEX)
+    input.persist(StorageLevel.fromString(getIntermediateStorageLevel))
+
     var (intercept, model) =
       if (isSet(initModelPath) && getInitModelPath.nonEmpty) {
         val m: DistributedFMModel = DistributedFMModel.load(getInitModelPath)
@@ -59,7 +76,7 @@ class DistributedFM extends FM {
 
       {
         println(s"update itercept")
-        intercept = DistributedFM.updateIntercept(dataset.toDF, intercept, model, getRank, getRegI1, getRegI2)
+        intercept = DistributedFM.updateIntercept(input, intercept, model, getRank, getRegI1, getRegI2)
       }
 
 
@@ -75,7 +92,7 @@ class DistributedFM extends FM {
           val selModel = model.withColumn(SELECTED,
             when(col(RANDOM).equalTo(group), true).otherwise(false))
 
-          model = DistributedFM.updateWeights(dataset.toDF, intercept, selModel, getRank, getRegW1, getRegW2)
+          model = DistributedFM.updateWeights(input, intercept, selModel, getRank, getRegW1, getRegW2)
 
           modelRDD = model.rdd
           modelSchema = model.schema
@@ -100,7 +117,7 @@ class DistributedFM extends FM {
           val selModel = model.withColumn(SELECTED,
             when(col(RANDOM).equalTo(group), true).otherwise(false))
 
-          model = DistributedFM.updateFactors(dataset.toDF, intercept, selModel, getRank, getRegV1, getRegV2, getRegVG, getMaxCCDIters)
+          model = DistributedFM.updateFactors(input, intercept, selModel, getRank, getRegV1, getRegV2, getRegVG, getMaxCCDIters)
 
           modelRDD = model.rdd
           modelSchema = model.schema
@@ -121,6 +138,7 @@ class DistributedFM extends FM {
 
     checkpointer.unpersistDataSet()
     checkpointer.deleteAllCheckpoints()
+    input.unpersist(false)
 
     new DistributedFMModel(uid, intercept, finalModel)
   }
@@ -655,6 +673,7 @@ class DistributedFMModel private[ml](override val uid: String,
 
 
 object DistributedFMModel extends MLReadable[DistributedFMModel] {
+
   override def read: MLReader[DistributedFMModel] = ???
 
   override def load(path: String): DistributedFMModel = super.load(path)

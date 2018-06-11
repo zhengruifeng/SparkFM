@@ -8,7 +8,8 @@ import org.apache.spark.storage.StorageLevel
 
 
 private[fm] trait FMParams extends Params
-  with HasMaxIter with HasRegParam with HasPredictionCol with HasCheckpointInterval with HasSeed {
+  with HasLabelCol with HasPredictionCol with HasWeightCol
+  with HasMaxIter with HasCheckpointInterval with HasSeed {
 
   /**
     * Param for the column name for non-zero feature indices.
