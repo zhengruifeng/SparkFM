@@ -62,25 +62,16 @@ private[fm] object Utils extends Logging {
   val INSTANCE_WEIGHT = "instance_weight"
 
   val INDEX = "index"
-  val GROUP = "group"
-  val INTRA_INDEX = "intra_index"
   val INDICES = "indices"
   val VALUES = "values"
   val VALUE = "value"
 
   val ERROR = "error"
-  val PREDICTION = "prediction"
   val DOTS = "dots"
   val PREDICTION_DOTS = "prediction_dots"
 
-  val EH = "eh"
-
-  val WEIGHT = "weight"
+  val LINEAR = "linear"
   val FACTOR = "factor"
-
-  val PREVIOUS_WEIGHT = "previous_weight"
-  val PREVIOUS_FACTOR = "previous_factor"
-  val PREVIOUS_EH = "previous_eh"
 
   val PROBLEM_YX = "problem_yx"
 
@@ -91,9 +82,6 @@ private[fm] object Utils extends Logging {
   val RANDOM = "random"
   val SELECTED = "selected"
   val SELECTED_INDICES = "selected_indices"
-
-  val FIRST = "first"
-
 
   def initStat[@spec(Float, Double) V: Fractional : ClassTag](k: Int): Array[V] = {
     // first k elements store X*y, the following k * (k + 1) / 2 elements store Xi*Xj

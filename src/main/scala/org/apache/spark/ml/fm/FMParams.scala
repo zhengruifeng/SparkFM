@@ -4,34 +4,14 @@ import scala.util.Try
 
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
+import org.apache.spark.ml.util.SchemaUtils
+import org.apache.spark.sql.types._
 import org.apache.spark.storage.StorageLevel
 
 
 private[fm] trait FMParams extends Params
-  with HasLabelCol with HasPredictionCol with HasWeightCol
-  with HasMaxIter with HasCheckpointInterval with HasSeed {
-
-  /**
-    * Param for the column name for non-zero feature indices.
-    * Default: "indices"
-    * @group param
-    */
-  val indiceCol = new Param[String](this, "indiceCol", "column name for non-zero feature indices")
-
-  /** @group getParam */
-  def getIndiceCol: String = $(indiceCol)
-
-
-  /**
-    * Param for the column name for non-zero feature values.
-    * Default: "values"
-    * @group param
-    */
-  val valuesCol = new Param[String](this, "valuesCol", "column name for non-zero feature values")
-
-  /** @group getParam */
-  def getValuesCol: String = $(valuesCol)
-
+  with HasLabelCol with HasWeightCol with HasFeaturesCol with HasPredictionCol
+  with HasFitIntercept with HasMaxIter with HasSeed {
 
   /**
     * Param for rank of the factorization machine (positive).
@@ -174,6 +154,101 @@ private[fm] trait FMParams extends Params
 
 
   /**
+    * Param for whether to fit linear coefficients.
+    * Default: true
+    * @group param
+    */
+  final val fitLinear: BooleanParam = new BooleanParam(this, "fitLinear", "whether to fit linear coefficients")
+
+  setDefault(fitLinear, true)
+
+  /** @group getParam */
+  final def getFitLinear: Boolean = $(fitLinear)
+
+
+  /**
+    * Param for initial model path
+    *
+    * @group expertParam
+    */
+  val initModelPath = new Param[String](this, "initModelPath", "initial model path")
+
+  /** @group expertGetParam */
+  def getInitModelPath: String = $(initModelPath)
+}
+
+
+private[fm] trait DistributedFMParams extends FMParams
+  with HasCheckpointInterval {
+
+  /**
+    * Param for number of features.
+    * Default: -1
+    *
+    * @group param
+    */
+  val numFeatures = new LongParam(this, "numFeatures", "number of features")
+
+  /** @group getParam */
+  def getNumFeatures: Long = $(numFeatures)
+
+  setDefault(numFeatures -> -1)
+
+
+  /**
+    * Param for the column name for instance indices.
+    * Default: "instanceIndex"
+    *
+    * @group param
+    */
+  val instanceIndexCol = new Param[String](this, "instanceIndexCol", "column name for instance indices")
+
+  /** @group getParam */
+  def getInstanceIndexCol: String = $(instanceIndexCol)
+
+  setDefault(instanceIndexCol -> "instanceIndex")
+
+
+  /**
+    * Param for the column name for non-zero feature indices.
+    * Default: "indices"
+    *
+    * @group param
+    */
+  val featureIndicesCol = new Param[String](this, "featureIndicesCol", "column name for non-zero feature indices")
+
+  /** @group getParam */
+  def getFeatureIndiceCol: String = $(featureIndicesCol)
+
+  setDefault(featureIndicesCol -> "featureIndices")
+
+
+  /**
+    * Param for the column name for non-zero feature values.
+    * Default: "featureValues"
+    *
+    * @group param
+    */
+  val featureValuesCol = new Param[String](this, "featureValuesCol", "column name for non-zero feature values")
+
+  /** @group getParam */
+  def getFeatureValuesCol: String = $(featureValuesCol)
+
+  setDefault(featureValuesCol -> "featureValues")
+
+
+  /**
+    * Param for directory for model checkpointing.
+    *
+    * @group param
+    */
+  val checkpointDir = new Param[String](this, "checkpointDir", "directory for model checkpointing")
+
+  /** @group getParam */
+  def getCheckpointDir: String = $(checkpointDir)
+
+
+  /**
     * Param for StorageLevel for intermediate datasets. Pass in a string representation of
     * `StorageLevel`. Cannot be "NONE".
     * Default: "MEMORY_AND_DISK".
@@ -207,13 +282,7 @@ private[fm] trait FMParams extends Params
   setDefault(finalStorageLevel -> "MEMORY_AND_DISK")
 
 
-  /**
-    * Param for initial model path
-    *
-    * @group expertParam
-    */
-  val initModelPath = new Param[String](this, "initModelPath", "initial model path")
-
-  /** @group expertGetParam */
-  def getInitModelPath: String = $(initModelPath)
+  protected def validateAndTransformSchema(schema: StructType): StructType = {
+    SchemaUtils.appendColumn(schema, $(predictionCol), FloatType)
+  }
 }
