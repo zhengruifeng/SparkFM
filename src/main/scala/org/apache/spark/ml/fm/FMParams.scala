@@ -47,12 +47,12 @@ private[fm] trait FMParams extends Params
     *
     * @group param
     */
-  val regI1 = new DoubleParam(this, "regI1", "L1-norm regularization of intercept", ParamValidators.gtEq(0))
+  val regInterceptL1 = new DoubleParam(this, "regInterceptL1", "L1-norm regularization of intercept", ParamValidators.gtEq(0))
 
   /** @group getParam */
-  def getRegI1: Double = $(regI1)
+  def getRegI1: Double = $(regInterceptL1)
 
-  setDefault(regI1 -> 0.0)
+  setDefault(regInterceptL1 -> 0.0)
 
 
   /**
@@ -61,12 +61,12 @@ private[fm] trait FMParams extends Params
     *
     * @group param
     */
-  val regI2 = new DoubleParam(this, "regI2", "L2-norm regularization of intercept", ParamValidators.gtEq(0))
+  val regInterceptL2 = new DoubleParam(this, "regInterceptL2", "L2-norm regularization of intercept", ParamValidators.gtEq(0))
 
   /** @group getParam */
-  def getRegI2: Double = $(regI2)
+  def getRegI2: Double = $(regInterceptL2)
 
-  setDefault(regI2 -> 0.0)
+  setDefault(regInterceptL2 -> 0.0)
 
 
   /**
@@ -75,12 +75,12 @@ private[fm] trait FMParams extends Params
     *
     * @group param
     */
-  val regW1 = new DoubleParam(this, "regW1", "L1-norm regularization of linear weights", ParamValidators.gtEq(0))
+  val regLinearL1 = new DoubleParam(this, "regLinearL1", "L1-norm regularization of linear weights", ParamValidators.gtEq(0))
 
   /** @group getParam */
-  def getRegW1: Double = $(regW1)
+  def getRegW1: Double = $(regLinearL1)
 
-  setDefault(regW1 -> 0.0)
+  setDefault(regLinearL1 -> 0.0)
 
 
   /**
@@ -89,12 +89,12 @@ private[fm] trait FMParams extends Params
     *
     * @group param
     */
-  val regW2 = new DoubleParam(this, "regW2", "L2-norm regularization of linear weights", ParamValidators.gtEq(0))
+  val regLinearL2 = new DoubleParam(this, "regLinearL2", "L2-norm regularization of linear weights", ParamValidators.gtEq(0))
 
   /** @group getParam */
-  def getRegW2: Double = $(regW2)
+  def getRegW2: Double = $(regLinearL2)
 
-  setDefault(regW2 -> 0.0)
+  setDefault(regLinearL2 -> 0.0)
 
 
   /**
@@ -103,12 +103,12 @@ private[fm] trait FMParams extends Params
     *
     * @group param
     */
-  val regV1 = new DoubleParam(this, "regV1", "L1-norm regularization of factors", ParamValidators.gtEq(0))
+  val regFactorL1 = new DoubleParam(this, "regFactorL1", "L1-norm regularization of factors", ParamValidators.gtEq(0))
 
   /** @group getParam */
-  def getRegV1: Double = $(regV1)
+  def getRegV1: Double = $(regFactorL1)
 
-  setDefault(regV1 -> 0.0)
+  setDefault(regFactorL1 -> 0.0)
 
 
   /**
@@ -117,12 +117,12 @@ private[fm] trait FMParams extends Params
     *
     * @group param
     */
-  val regV2 = new DoubleParam(this, "regV2", "L2-norm regularization of factors", ParamValidators.gtEq(0))
+  val regFactorL2 = new DoubleParam(this, "regFactorL2", "L2-norm regularization of factors", ParamValidators.gtEq(0))
 
   /** @group getParam */
-  def getRegV2: Double = $(regV2)
+  def getRegV2: Double = $(regFactorL2)
 
-  setDefault(regV2 -> 0.0)
+  setDefault(regFactorL2 -> 0.0)
 
 
   /**
@@ -131,12 +131,12 @@ private[fm] trait FMParams extends Params
     *
     * @group param
     */
-  val regVG = new DoubleParam(this, "regVG", "L2-norm regularization of factor-groups", ParamValidators.gtEq(0))
+  val regFactorLG = new DoubleParam(this, "regFactorLG", "L2-norm regularization of factor-groups", ParamValidators.gtEq(0))
 
   /** @group getParam */
-  def getRegVG: Double = $(regVG)
+  def getRegVG: Double = $(regFactorLG)
 
-  setDefault(regVG -> 0.0)
+  setDefault(regFactorLG -> 0.0)
 
 
   /**
@@ -211,7 +211,7 @@ private[fm] trait DistributedFMParams extends FMParams
 
   /**
     * Param for the column name for non-zero feature indices.
-    * Default: "indices"
+    * Default: "featureIndices"
     *
     * @group param
     */

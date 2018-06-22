@@ -1,25 +1,18 @@
 package org.apache.spark.ml.fm
 
-import java.{util => ju}
-
-import scala.reflect.{ClassTag, classTag}
-import scala.{specialized => spec}
-
 import scala.collection.mutable
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
-import scala.reflect.{ClassTag, classTag}
-import scala.util.{Failure, Random, Success}
+import scala.util.{Failure, Success}
+
 import org.apache.hadoop.fs.Path
 import org.apache.spark._
 import org.apache.spark.internal.Logging
-import org.apache.spark.ml.linalg._
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.expressions.{MutableAggregationBuffer, UserDefinedAggregateFunction}
-import org.apache.spark.sql.types._
-import org.apache.spark.sql.{DataFrame, Row, SparkSession}
+import org.apache.spark.sql._
 import org.apache.spark.storage.StorageLevel
-import org.apache.spark.util.random.XORShiftRandom
+import org.apache.spark.unsafe.hash.Murmur3_x86_32
+
 
 private trait FromDouble[H] extends Serializable {
 
@@ -55,235 +48,43 @@ private[fm] object FromDouble {
 }
 
 
-private[fm] object Utils extends Logging {
+case class IndicesSelector(denominator: Int,
+                           remainder: Int,
+                           seed: Long) {
+  require(denominator > 0)
+  require(remainder >= 0 && remainder < denominator)
 
-  val INSTANCE_INDEX = "instance_index"
-  val INSTANCE_LABEL = "instance_label"
-  val INSTANCE_WEIGHT = "instance_weight"
-
-  val INDEX = "index"
-  val INDICES = "indices"
-  val VALUES = "values"
-  val VALUE = "value"
-
-  val ERROR = "error"
-  val DOTS = "dots"
-  val PREDICTION_DOTS = "prediction_dots"
-
-  val LINEAR = "linear"
-  val FACTOR = "factor"
-
-  val PROBLEM_YX = "problem_yx"
-
-  val STAT = "stat"
-  val SOLUTION = "solution"
-  val PREV_SOLUTION = "prev_solution"
-
-  val RANDOM = "random"
-  val SELECTED = "selected"
-  val SELECTED_INDICES = "selected_indices"
-
-  def initStat[@spec(Float, Double) V: Fractional : ClassTag](k: Int): Array[V] = {
-    // first k elements store X*y, the following k * (k + 1) / 2 elements store Xi*Xj
-    Array.ofDim[V](k * (k + 3) / 2)
+  def contain(index: Long): Boolean = {
+    Murmur3_x86_32.hashLong(index, seed.toInt).abs % denominator == remainder
   }
+}
 
-  def updateStat[@spec(Float, Double) V: Fractional](stat: Array[V],
-                                                     k: Int,
-                                                     w: V,
-                                                     x: Array[V],
-                                                     y: V): Unit = {
-    val fraV = implicitly[Fractional[V]]
-    import fraV._
+object Utils extends Serializable {
 
-    var index = k
-    var i = 0
-    var j = 0
-    while (i < k) {
-      j = i
-      while (j < k) {
-        stat(index) += x(i) * x(j) * w
-        index += 1
-        j += 1
-      }
-      stat(i) += x(i) * y * w
-      i += 1
-    }
-  }
 
-  def mergeStat[@spec(Float, Double) V: Fractional](stat1: Array[V],
-                                                    stat2: Array[V]): Unit = {
-    val fraV = implicitly[Fractional[V]]
-    import fraV._
+  def cleanShuffleDependencies(sc: SparkContext,
+                               deps: Seq[Dependency[_]],
+                               blocking: Boolean = false): Unit = {
+    // If there is no reference tracking we skip clean up.
+    sc.cleaner.foreach { cleaner =>
 
-    require(stat1.length == stat2.length)
-    var i = 0
-    while (i < stat1.length) {
-      stat1(i) += stat2(i)
-      i += 1
-    }
-  }
-
-  def solve[@spec(Float, Double) V: Fractional : FromDouble : ClassTag](stat: Array[V],
-                                                                        k: Int,
-                                                                        regL1: Double,
-                                                                        regL2: Double,
-                                                                        regLG: Double,
-                                                                        prev: Array[V],
-                                                                        iters: Int): Array[V] = {
-    val fraV = implicitly[Fractional[V]]
-    import fraV._
-
-    val stat_ = stat.map(_.toDouble)
-    val prev_ = prev.map(_.toDouble)
-    val solution = solveImpl(stat_, k, regL1, regL2, regLG, prev_, iters)
-
-    val toV = implicitly[FromDouble[V]]
-    solution.map(toV.fromDouble)
-  }
-
-  private def solveImpl(stat: Array[Double],
-                        k: Int,
-                        regL1: Double,
-                        regL2: Double,
-                        regLG: Double,
-                        prev: Array[Double],
-                        iters: Int): Array[Double] = {
-
-    val solution = prev.clone()
-
-    for (iter <- 0 until iters; i <- 0 until k) {
-      val a = getXiXj(stat, i, i, k) + regL2
-
-      var b = getXiY(stat, i)
-      for (j <- 0 until k if j != i) {
-        b -= solution(j) * getXiXj(stat, i, j, k)
-      }
-      b *= -2
-
-      if (regLG == 0 ||
-        solution.zipWithIndex.filter(_._2 != k).forall(_._1 == 0)) {
-        // standard one-variable elastic net problem
-        val c = regL1 + regLG
-        val s = solveEN(a, b, c)
-        if (!s.isNaN) {
-          solution(i) = s
+      /**
+        * Clean the shuffles & all of its parents.
+        */
+      def cleanEagerly(dep: Dependency[_]): Unit = {
+        if (dep.isInstanceOf[ShuffleDependency[_, _, _]]) {
+          val shuffleId = dep.asInstanceOf[ShuffleDependency[_, _, _]].shuffleId
+          cleaner.doCleanupShuffle(shuffleId, blocking)
         }
-
-      } else {
-
-        val w0 = solution(i)
-        val e = solution.map(w => w * w).sum - w0 * w0
-        val s = solveGL(a, b, regL1, regLG, e, w0)
-        if (!s.isNaN) {
-          solution(i) = s
+        val rdd = dep.rdd
+        val rddDeps = rdd.dependencies
+        if (rdd.getStorageLevel == StorageLevel.NONE && rddDeps != null) {
+          rddDeps.foreach(cleanEagerly)
         }
       }
+
+      deps.foreach(cleanEagerly)
     }
-
-    solution
-  }
-
-  private def getXiXj[@spec(Float, Double) V](stat: Array[V],
-                                              i: Int,
-                                              j: Int,
-                                              k: Int): V = {
-    val index = if (i < j) {
-      k + (k * 2 - i - 1) * i / 2 + j
-    } else {
-      k + (k * 2 - j - 1) * j / 2 + i
-    }
-    stat(index)
-  }
-
-  private def getXiY[@spec(Float, Double) V](stat: Array[V], i: Int): V = {
-    stat(i)
-  }
-
-
-  // f(x) = a x^2 + b x + c |x|
-  // return argmin_x f(x)
-  private def solveEN(a: Double,
-                      b: Double,
-                      c: Double): Double = {
-    if (a > 0 && c >= 0) {
-      if (b + c < 0) {
-        -(b + c) / a / 2
-      } else if (b - c > 0) {
-        (c - b) / a / 2
-      } else {
-        0.0F
-      }
-    } else {
-      Double.NaN
-    }
-  }
-
-  // return a x^2 + b x + c |x| + d (x^2 + e)^0.5
-  private def loss(a: Double,
-                   b: Double,
-                   c: Double,
-                   d: Double,
-                   e: Double,
-                   x: Double): Double = {
-    a * x * x + b * x + c * math.abs(x) + d * math.sqrt(x * x + e)
-  }
-
-  // f(x) = a x^2 + b x + c |x| + d (x^2 + e)^0.5
-  // return argmin_x f(x)
-  private def solveGL(a: Double,
-                      b: Double,
-                      c: Double,
-                      d: Double,
-                      e: Double,
-                      x0: Double,
-                      iters: Int = 5): Double = {
-    // use two order approx near x0 instead of d (x^2 + e)^0.5
-
-    if (a > 0 && c >= 0 && d >= 0 && e >= 0) {
-      val n = math.sqrt(x0 * x0 + e)
-      val g1 = d * x0 / n
-      val g2 = d * e / n / n / n
-
-      val a_ = a + g2 / 2
-      val b_ = b + g1 + g2 * x0
-
-      val l0 = loss(a, b, c, d, e, x0)
-
-      val s0 = solveEN(a_, b_, c)
-
-      if (s0.isNaN) {
-        Double.NaN
-      } else {
-        var ok = false
-        var v = s0 - x0
-        for (i <- 0 until iters) {
-          if (!ok) {
-            if (loss(a, b, c, d, e, x0 + v) < l0) {
-              ok = true
-            } else {
-              v *= 0.618
-            }
-          }
-        }
-
-        if (ok) {
-          x0 + v
-        } else {
-          Double.NaN
-        }
-      }
-    } else {
-      Double.NaN
-    }
-  }
-
-
-  def truncate(df: DataFrame): DataFrame = {
-    val spark = df.sparkSession
-    val rdd = df.rdd
-    val schema = df.schema
-    spark.createDataFrame(rdd, schema)
   }
 }
 
@@ -368,6 +169,8 @@ private[fm] class Checkpointer[T](val sc: SparkContext,
           canDelete = false
         }
       }
+
+      Utils.cleanShuffleDependencies(sc, data.dependencies)
     }
   }
 
@@ -431,6 +234,95 @@ private[fm] class Checkpointer[T](val sc: SparkContext,
         case Failure(t) =>
           logWarning(s"fail to remove old checkpoint file: $file, ${t.toString}")
       }
+    }
+  }
+}
+
+
+private[fm] class DataFrameCheckpointer(val spark: SparkSession,
+                                        val checkpointInterval: Int,
+                                        val checkpointDir: String,
+                                        val storageLevel: StorageLevel,
+                                        val maxPersisted: Int) extends Logging {
+  def this(spark: SparkSession, checkpointInterval: Int, checkpointDir: String, storageLevel: StorageLevel) =
+    this(spark, checkpointInterval, checkpointDir, storageLevel, 2)
+
+  require(storageLevel != StorageLevel.NONE)
+  require(maxPersisted > 1)
+
+  /** FIFO queue of past checkpointed Datasets */
+  private val checkpointedFileQueue = mutable.Queue.empty[String]
+
+  /** FIFO queue of past persisted Datasets */
+  private val persistedQueue = mutable.Queue.empty[DataFrame]
+
+  /** Number of times [[update()]] has been called */
+  private var updateCount = 0
+
+  /**
+    * Update with a new Dataset. Handle persistence and checkpointing as needed.
+    * Since this handles persistence and checkpointing, this should be called before the Dataset
+    * has been materialized.
+    *
+    * @param data New Dataset created from previous Datasets in the lineage.
+    */
+  def update(data: DataFrame): DataFrame = {
+    val newData = if (checkpointDir.nonEmpty &&
+      checkpointInterval != -1 && (updateCount % checkpointInterval) == 0) {
+      val file = s"${checkpointDir}/DataFrame_Snapshot_${updateCount}"
+      data.write.mode(SaveMode.Overwrite).parquet(file)
+      checkpointedFileQueue.enqueue(file)
+      spark.read.parquet(file)
+    } else {
+      truncate(data)
+    }
+
+    newData.persist(storageLevel)
+    persistedQueue.enqueue(newData)
+
+    while (checkpointedFileQueue.length > 1) {
+      removeCheckpointFile(checkpointedFileQueue.dequeue)
+    }
+
+    while (persistedQueue.length > maxPersisted) {
+      persistedQueue.dequeue.unpersist(false)
+    }
+
+    updateCount += 1
+
+    newData
+  }
+
+  def cleanup(): Unit = {
+    while (checkpointedFileQueue.nonEmpty) {
+      removeCheckpointFile(checkpointedFileQueue.dequeue)
+    }
+
+    while (persistedQueue.nonEmpty) {
+      persistedQueue.dequeue.unpersist(false)
+    }
+  }
+
+  def truncate(df: DataFrame): DataFrame = {
+    val rdd = df.rdd
+    val schema = df.schema
+    spark.createDataFrame(rdd, schema)
+  }
+
+  private def removeCheckpointFile(file: String): Unit = {
+    Future {
+      val start = System.nanoTime
+      val path = new Path(file)
+      val fs = path.getFileSystem(spark.sparkContext.hadoopConfiguration)
+      fs.delete(path, true)
+      (System.nanoTime - start) / 1e9
+
+    }.onComplete {
+      case Success(v) =>
+        logInfo(s"successfully remove old checkpoint file: $file, duration $v seconds")
+
+      case Failure(t) =>
+        logWarning(s"fail to remove old checkpoint file: $file, ${t.toString}")
     }
   }
 }

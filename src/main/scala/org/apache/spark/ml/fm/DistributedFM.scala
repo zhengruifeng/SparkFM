@@ -3,8 +3,6 @@ package org.apache.spark.ml.fm
 import scala.collection.mutable
 
 import org.apache.hadoop.fs.Path
-import org.json4s.DefaultFormats
-import org.json4s.JsonDSL._
 
 import org.apache.spark.ml._
 import org.apache.spark.ml.linalg._
@@ -12,15 +10,17 @@ import org.apache.spark.ml.param._
 import org.apache.spark.ml.util._
 import org.apache.spark.sql._
 import org.apache.spark.sql.expressions._
-import org.apache.spark.sql.types._
 import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types._
 import org.apache.spark.storage.StorageLevel
 
 
-class DistributedFM extends Estimator[DistributedFMModel]
+class DistributedFM(override val uid: String) extends Estimator[DistributedFMModel]
   with DistributedFMParams with DefaultParamsWritable {
 
-  import Utils._
+  def this() = this(Identifiable.randomUID("distributed_fm"))
+
+  import DistributedFM._
 
   def setLabelCol(value: String): this.type = set(labelCol, value)
 
@@ -38,29 +38,33 @@ class DistributedFM extends Estimator[DistributedFMModel]
 
   def setFitIntercept(value: Boolean): this.type = set(fitIntercept, value)
 
+  def setFitLinear(value: Boolean): this.type = set(fitLinear, value)
+
   def setMaxIter(value: Int): this.type = set(maxIter, value)
 
   def setSeed(value: Long): this.type = set(seed, value)
 
   def setCheckpointInterval(value: Int): this.type = set(checkpointInterval, value)
 
+  def setCheckpointDir(value: String): this.type = set(checkpointDir, value)
+
   def setRank(value: Int): this.type = set(rank, value)
 
   def setNumRandGroups(value: Int): this.type = set(numRandGroups, value)
 
-  def setRegI1(value: Double): this.type = set(regI1, value)
+  def setRegInterceptL1(value: Double): this.type = set(regInterceptL1, value)
 
-  def setRegI2(value: Double): this.type = set(regI2, value)
+  def setRegInterceptL2(value: Double): this.type = set(regInterceptL2, value)
 
-  def setRegW1(value: Double): this.type = set(regW1, value)
+  def setRegLinearL1(value: Double): this.type = set(regLinearL1, value)
 
-  def setRegW2(value: Double): this.type = set(regW2, value)
+  def setRegLinearL2(value: Double): this.type = set(regLinearL2, value)
 
-  def setRegV1(value: Double): this.type = set(regV1, value)
+  def setRegFactorL1(value: Double): this.type = set(regFactorL1, value)
 
-  def setRegV2(value: Double): this.type = set(regV2, value)
+  def setRegFactorL2(value: Double): this.type = set(regFactorL2, value)
 
-  def setRegVG(value: Double): this.type = set(regVG, value)
+  def setRegFactorLG(value: Double): this.type = set(regFactorLG, value)
 
   def setNumFeaturesG(value: Long): this.type = set(numFeatures, value)
 
@@ -71,9 +75,6 @@ class DistributedFM extends Estimator[DistributedFMModel]
   def setIntermediateStorageLevel(value: String): this.type = set(intermediateStorageLevel, value)
 
   def setFinalStorageLevel(value: String): this.type = set(finalStorageLevel, value)
-
-
-  override val uid: String = "distributed_fm"
 
   override def fit(dataset: Dataset[_]): DistributedFMModel = {
 
@@ -93,75 +94,84 @@ class DistributedFM extends Estimator[DistributedFMModel]
       input.persist(StorageLevel.fromString($(intermediateStorageLevel)))
     }
 
+    val checkpointer = new DataFrameCheckpointer(spark, $(checkpointInterval), $(checkpointDir),
+      StorageLevel.fromString($(intermediateStorageLevel)))
+
     var (intercept, model) = initialize(spark, realNumFeatures)
+    model = checkpointer.update(model)
+    model.sort(INDEX).show(10, false)
 
     val instr = Instrumentation.create(this, dataset)
+    instr.logParams(params: _*)
 
     var iter = 0
     while (iter < $(maxIter)) {
-      instr.log(s"Iteration $iter")
+      instr.log(s"iteration $iter")
 
       if ($(fitIntercept)) {
-        instr.log(s"update itercept")
-        intercept = DistributedFM.updateIntercept(input, intercept, model, $(rank), $(regI1), $(regI2))
+        instr.log(s"iteration $iter: update intercept")
+        intercept = updateIntercept(input, intercept, model,
+          $(rank), $(regInterceptL1), $(regInterceptL2))
+
+        Seq(intercept).toDF("intercept").show
       }
 
       if ($(fitLinear)) {
         model = model.select(INDEX, LINEAR, FACTOR)
           .sort(INDEX)
-          .withColumn(RANDOM, (rand($(seed) + iter) * $(numRandGroups)).cast(IntegerType))
+          .withColumn(RANDOM, (rand(iter + $(seed)) * $(numRandGroups)).cast(IntegerType))
 
         var group = 0
         while (group < $(numRandGroups)) {
-          instr.log(s"update weights $group")
+          instr.log(s"iteration $iter: update linear $group")
 
-          val selModel = model.withColumn(SELECTED,
+          val modelWithFlag = model.withColumn(SELECTED,
             when(col(RANDOM).equalTo(group), true).otherwise(false))
 
-          model = DistributedFM.updateLinears(input, intercept, selModel, $(rank), $(regW1), $(regW2))
+          model = updateLinears(input, intercept, modelWithFlag,
+            $(rank), $(regLinearL1), $(regLinearL2))
+          model = checkpointer.update(model)
 
-          val path = s"${$(checkpointDir)}/Iter-${iter}_Linears${group}_FM_Snapshot"
-
-          model.write
-            .mode(SaveMode.Overwrite)
-            .parquet(path)
-
-          model = spark.read.parquet(path)
+          model.sort(INDEX).show(10, false)
 
           group += 1
         }
+
+        model.count()
+        System.gc()
       }
 
       {
         model = model.select(INDEX, LINEAR, FACTOR)
           .sort(INDEX)
-          .withColumn(RANDOM, (rand(-$(seed) - iter) * $(numRandGroups)).cast(IntegerType))
+          .withColumn(RANDOM, (rand(iter - $(seed)) * $(numRandGroups)).cast(IntegerType))
 
         var group = 0
         while (group < $(numRandGroups)) {
-          instr.log(s"update factors $group")
+          instr.log(s"iteration $iter: update factors $group")
 
-          val selModel = model.withColumn(SELECTED,
+          val modelWithFlag = model.withColumn(SELECTED,
             when(col(RANDOM).equalTo(group), true).otherwise(false))
 
-          model = DistributedFM.updateFactors(input, intercept, selModel, $(rank), $(regV1), $(regV2), $(regVG), $(maxCCDIters))
+          model = updateFactors(input, intercept, modelWithFlag,
+            $(rank), $(regFactorL1), $(regFactorL2), $(regFactorLG), $(maxCCDIters))
 
-          val path = s"${$(checkpointDir)}/Iter-${iter}_Factors${group}_FM_Snapshot"
+          model = checkpointer.update(model)
 
-          model.write
-            .mode(SaveMode.Overwrite)
-            .parquet(path)
+          model.sort(INDEX).show(10, false)
 
-          model = spark.read.parquet(path)
 
           group += 1
         }
+
+        model.count()
+        System.gc()
       }
 
       iter += 1
     }
 
-    val finalModel = model.select(INDEX, LINEAR, FACTOR)
+    var finalModel = model.select(INDEX, LINEAR, FACTOR)
       .as[(Long, Float, Array[Float])]
       .flatMap { case (index, linear, factor) =>
         if (factor.forall(_ == 0)) {
@@ -175,17 +185,22 @@ class DistributedFM extends Estimator[DistributedFMModel]
         }
       }.toDF(INDEX, LINEAR, FACTOR)
 
+    finalModel = checkpointer.truncate(finalModel)
     finalModel.persist(StorageLevel.fromString($(finalStorageLevel)))
     finalModel.count()
+
+    checkpointer.cleanup()
 
     if (handlePersistence) {
       input.unpersist(false)
     }
 
-    new DistributedFMModel(uid, intercept, finalModel)
+    val fmm = new DistributedFMModel(uid, intercept, finalModel)
+    instr.logSuccess(fmm)
+    copyValues(fmm)
   }
 
-  private def computeNumFeatures(dataset: Dataset[_]): Long = {
+  def computeNumFeatures(dataset: Dataset[_]): Long = {
     val spark = dataset.sparkSession
     import spark.implicits._
 
@@ -209,7 +224,7 @@ class DistributedFM extends Estimator[DistributedFMModel]
     }
   }
 
-  private def formatInput(dataset: Dataset[_]): DataFrame = {
+  def formatInput(dataset: Dataset[_]): DataFrame = {
     val spark = dataset.sparkSession
     import spark.implicits._
 
@@ -243,16 +258,16 @@ class DistributedFM extends Estimator[DistributedFMModel]
         }.toDF(INDICES, VALUES, INSTANCE_LABEL, INSTANCE_WEIGHT, INSTANCE_INDEX)
 
     } else {
-      dataset.select(col($(featureIndicesCol)).as(INDICES),
-        col($(featureValuesCol)).as(VALUES),
+      dataset.select(col($(featureIndicesCol)).cast(ArrayType(LongType)).as(INDICES),
+        col($(featureValuesCol)).cast(ArrayType(FloatType)).as(VALUES),
         col($(labelCol)).cast(FloatType).as(INSTANCE_LABEL),
         w.cast(FloatType).as(INSTANCE_WEIGHT),
         col($(instanceIndexCol)).cast(LongType).as(INSTANCE_INDEX))
     }
   }
 
-  private def initialize(spark: SparkSession,
-                         numFeatures: Long): (Float, DataFrame) = {
+  def initialize(spark: SparkSession,
+                 numFeatures: Long): (Float, DataFrame) = {
     if (isSet(initModelPath) && $(initModelPath).nonEmpty) {
       val m = DistributedFMModel.load($(initModelPath))
       (m.intercept, m.model)
@@ -263,7 +278,7 @@ class DistributedFM extends Estimator[DistributedFMModel]
 
       (0.0F,
         spark.range(numFeatures).toDF(INDEX)
-          .withColumns(Seq(LINEAR, FACTOR), Seq(lit(0.0F, array(randCols: _*)))))
+          .withColumns(Seq(LINEAR, FACTOR), Seq(lit(0.0F), array(randCols: _*))))
     }
   }
 
@@ -278,7 +293,31 @@ class DistributedFM extends Estimator[DistributedFMModel]
 
 object DistributedFM extends Serializable {
 
-  import Utils._
+  val INSTANCE_INDEX = "instance_index"
+  val INSTANCE_LABEL = "instance_label"
+  val INSTANCE_WEIGHT = "instance_weight"
+
+  val INDEX = "index"
+  val INDICES = "indices"
+  val VALUES = "values"
+  val VALUE = "value"
+
+  val ERROR = "error"
+  val DOTS = "dots"
+  val PREDICTION_DOTS = "prediction_dots"
+
+  val LINEAR = "linear"
+  val FACTOR = "factor"
+
+  val PROBLEM_YX = "problem_yx"
+
+  val STAT = "stat"
+  val SOLUTION = "solution"
+  val PREV_SOLUTION = "prev_solution"
+
+  val RANDOM = "random"
+  val SELECTED = "selected"
+  val SELECTED_INDICES = "selected_indices"
 
   /**
     * input
@@ -370,9 +409,9 @@ object DistributedFM extends Serializable {
       .join(model.select(INDEX, LINEAR).where(col(SELECTED)).hint("broadcast"), INDEX)
       .select(INSTANCE_LABEL, INSTANCE_WEIGHT, INDEX, VALUE, PREDICTION_DOTS, LINEAR)
       .as[(Float, Float, Long, Float, Array[Float], Float)]
-      .map { case (instanceLabel, instanceWeight, index, value, predDots, weight) =>
-        val y = instanceLabel - predDots.head + value * weight
-        (index, instanceWeight, Array(y, value), Array(0.0))
+      .map { case (instanceLabel, instanceWeight, index, value, predDots, linear) =>
+        val y = instanceLabel - predDots.head + value * linear
+        (index, instanceWeight, Array(y, value), Array(0.0F))
       }.toDF(INDEX, INSTANCE_WEIGHT, PROBLEM_YX, PREV_SOLUTION)
 
     val solutions = solve(problems, 1, regW1, regW2, 0.0, 1)
@@ -414,6 +453,8 @@ object DistributedFM extends Serializable {
     import spark.implicits._
 
     val predicted = predictAndFlatten(input, intercept, model, rank)
+
+    predicted.sort(INDEX).show(10, false)
 
     val problems = predicted
       .join(model.select(INDEX, FACTOR).where(col(SELECTED)).hint("broadcast"), INDEX)
@@ -543,15 +584,17 @@ object DistributedFM extends Serializable {
     val spark = problems.sparkSession
     import spark.implicits._
 
-    val probStatUDAF = new ProblemStatUDAF(k)
+    //    problems.sort(INDEX).show(10, false)
 
-    problems.groupBy(col(INDEX))
+    val statUDAF = new ProblemStatUDAF(k)
+
+    problems.groupBy(INDEX)
       .agg(first(col(PREV_SOLUTION)).as(PREV_SOLUTION),
-        probStatUDAF(col(INSTANCE_WEIGHT), col(PROBLEM_YX)).as(STAT))
+        statUDAF(col(INSTANCE_WEIGHT), col(PROBLEM_YX)).as(STAT))
       .select(INDEX, STAT, PREV_SOLUTION)
       .as[(Long, Array[Float], Array[Float])]
       .map { case (index, stat, prevSolution) =>
-        val solution = Utils.solve[Float](stat, k, regL1, regL2, regLG, prevSolution, iters)
+        val solution = Solver.solve[Float](stat, k, regL1.toFloat, regL2.toFloat, regLG.toFloat, prevSolution, iters)
         (index, solution)
       }.toDF(INDEX, SOLUTION)
   }
@@ -563,7 +606,7 @@ class predictWithDotsUDAF(val rank: Int,
 
   override def inputSchema: StructType = StructType(
     StructField("value", FloatType, false) ::
-      StructField("weight", FloatType, false) ::
+      StructField("linear", FloatType, false) ::
       StructField("factor", ArrayType(FloatType, false), false) :: Nil
   )
 
@@ -655,7 +698,7 @@ class ProblemStatUDAF(val k: Int) extends UserDefinedAggregateFunction {
   require(k > 0)
 
   override def inputSchema: StructType = StructType(
-    StructField("weight", FloatType, false) ::
+    StructField("linear", FloatType, false) ::
       StructField("yx", ArrayType(FloatType, false), false) :: Nil
   )
 
@@ -668,7 +711,7 @@ class ProblemStatUDAF(val k: Int) extends UserDefinedAggregateFunction {
   override def deterministic: Boolean = true
 
   override def initialize(buffer: MutableAggregationBuffer): Unit = {
-    buffer(0) = Utils.initStat[Float](k)
+    buffer(0) = Solver.initStat[Float](k)
   }
 
   override def update(buffer: MutableAggregationBuffer, input: Row): Unit = {
@@ -680,15 +723,13 @@ class ProblemStatUDAF(val k: Int) extends UserDefinedAggregateFunction {
     require(x.length == k)
 
     val stat = buffer.getSeq[Float](0).toArray
-    Utils.updateStat[Float](stat, k, w, x, y)
-    buffer(0) = stat
+    buffer(0) = Solver.updateStat[Float](stat, k, w, x, y)
   }
 
   override def merge(buffer1: MutableAggregationBuffer, buffer2: Row): Unit = {
     val stat1 = buffer1.getSeq[Float](0).toArray
     val stat2 = buffer2.getSeq[Float](0).toArray
-    Utils.mergeStat[Float](stat1, stat2)
-    buffer1(0) = stat1
+    buffer1(0) = Solver.mergeStat[Float](stat1, stat2)
   }
 
   override def evaluate(buffer: Row): Any = {
@@ -703,16 +744,16 @@ class DistributedFMModel private[ml](override val uid: String,
   extends Model[DistributedFMModel] with DistributedFMParams with MLWritable {
 
   override def transform(dataset: Dataset[_]): DataFrame = {
-    import Utils._
+    import DistributedFM._
 
     val spark = dataset.sparkSession
     import spark.implicits._
 
     val predUDAF = new predictWithDotsUDAF($(rank), intercept)
 
-    dataset.select(col($(featureIndicesCol)).as(INDICES),
-      col($(featureValuesCol)).as(VALUES),
-      col($(instanceIndexCol)).cast(LongType).as(INSTANCE_INDEX))
+    dataset.select(col($(instanceIndexCol)).cast(LongType).as(INSTANCE_INDEX),
+      col($(featureIndicesCol)).cast(ArrayType(LongType)).as(INDICES),
+      col($(featureValuesCol)).cast(ArrayType(FloatType)).as(VALUES))
       .as[(Long, Array[Long], Array[Float])]
 
       .flatMap { case (instanceIndex, indices, values) =>
@@ -752,7 +793,7 @@ class DistributedFMModel private[ml](override val uid: String,
 
 object DistributedFMModel extends MLReadable[DistributedFMModel] {
 
-  import Utils._
+  import DistributedFM._
 
   override def read: MLReader[DistributedFMModel] = new DistributedFMModelReader
 
