@@ -1,11 +1,11 @@
 package org.apache.spark.ml.fm
 
 import org.apache.hadoop.fs.Path
+import org.apache.spark.{HashPartitioner, Partitioner}
 
 import scala.collection.mutable
 import scala.reflect.ClassTag
 import scala.{specialized => spec}
-
 import org.apache.spark.ml._
 import org.apache.spark.ml.linalg._
 import org.apache.spark.ml.param.ParamMap
@@ -19,7 +19,7 @@ import org.apache.spark.storage.StorageLevel
 class DistributedSFM(override val uid: String) extends Estimator[DistributedSFMModel]
   with DistributedFMParams with DefaultParamsWritable {
 
-  def this() = this(Identifiable.randomUID("distributed_sfm"))
+  def this() = this(Identifiable.randomUID("distributed_fm"))
 
   import DistributedSFM._
 
@@ -86,43 +86,36 @@ class DistributedSFM(override val uid: String) extends Estimator[DistributedSFMM
     val spark = dataset.sparkSession
     import spark.implicits._
 
+    val instr = Instrumentation.create(this, dataset)
+    instr.logParams(params: _*)
+
     val maxFeature = computeMaxFeature(dataset)
 
     val numFeatures = maxFeature
 
     val instances = extractInstances(dataset)
-
-    val handlePersistence = dataset.storageLevel == StorageLevel.NONE
-    if (handlePersistence) {
-      instances.persist(StorageLevel.fromString($(intermediateStorageLevel)))
-    }
-    instances.count()
-
-
-    //    val storageLevel = StorageLevel.fromString($(intermediateStorageLevel))
-
+    val partitioner = new HashPartitioner(instances.getNumPartitions)
+    val flattened = flattenInstances(instances, partitioner)
+    flattened.persist(StorageLevel.fromString($(intermediateStorageLevel)))
+    flattened.count()
 
     val checkpointer = new Checkpointer[(Long, (Float, Array[Float]))](spark.sparkContext,
       $(checkpointInterval), StorageLevel.fromString($(intermediateStorageLevel)))
 
-    var (intercept, modelDF) = initialize(spark, numFeatures)
-    modelDF.show(10, false)
+    val initialized = initialize(spark, numFeatures)
 
-    var model: RDD[(Long, (Float, Array[Float]))] = modelDF.select("index", "linear", "factor")
+    var intercept = initialized._1
+
+    var model = initialized._2.select("index", "linear", "factor")
       .as[(Long, Float, Array[Float])]
       .rdd
       .map { case (index, linear, factor) =>
         (index, (linear, factor))
-      }
-
-    //    model.persist(storageLevel)
-    //    model.count()
+      }.partitionBy(partitioner)
 
     checkpointer.update(model)
     model.count()
 
-    val instr = Instrumentation.create(this, dataset)
-    instr.logParams(params: _*)
 
     var iter = 0
     while (iter < $(maxIter)) {
@@ -130,8 +123,11 @@ class DistributedSFM(override val uid: String) extends Estimator[DistributedSFMM
 
       if ($(fitIntercept)) {
         instr.log(s"iteration $iter: update intercept")
-        intercept = updateIntercept[Float](instances, intercept, model,
-          $(rank), $(regInterceptL1).toFloat, $(regInterceptL2).toFloat)
+        val predictions = predict(flattened, intercept, model, $(rank))
+        intercept = updateIntercept2(predictions, intercept, model, $(rank), $(regInterceptL1).toFloat, $(regInterceptL2).toFloat)
+
+        //        intercept = updateIntercept[Float](instances, intercept, model,
+        //          $(rank), $(regInterceptL1).toFloat, $(regInterceptL2).toFloat)
 
         Seq(intercept).toDF("intercept").show
       }
@@ -141,33 +137,25 @@ class DistributedSFM(override val uid: String) extends Estimator[DistributedSFMM
         while (group < $(numRandGroups)) {
           instr.log(s"iteration $iter: update linear $group")
 
-          //          val prevModel = model
-
-          val (newModel, modified) = updateLinears[Float](instances, intercept, model,
+          val predictions = predict(flattened, intercept, model, $(rank))
+          model = updateLinears2(predictions, intercept, model, partitioner,
             $(rank), $(regLinearL1).toFloat, $(regLinearL2).toFloat,
             $(numRandGroups), group, $(seed) + iter)
 
-          if (modified) {
-            model = newModel
-//            checkpointer.update(model)
-//            //            model.persist(storageLevel)
-//            model.count()
+          checkpointer.update(model)
+          model.count()
 
-            val path = s"${$(checkpointDir)}/$iter-linear-$group"
-            model.saveAsObjectFile(path)
-
-            model = spark.sparkContext.objectFile[(Long, (Float, Array[Float]))](path)
-
-            //            prevModel.unpersist(false)
-
-          } else {
-            Seq("non-modification").toDF("linear").show(10, false)
-          }
-
-          model.map {
-            case (index, (linear, factor)) =>
-              (index, linear, factor)
-          }.toDF("index", "linear", "factor").sort("index").show(10, false)
+          //          val (newModel, modified) = updateLinears[Float](instances, intercept, model,
+          //            $(rank), $(regLinearL1).toFloat, $(regLinearL2).toFloat,
+          //            $(numRandGroups), group, $(seed) + iter)
+          //
+          //          if (modified) {
+          //            model = newModel
+          //            checkpointer.update(model)
+          //            model.count()
+          //          } else {
+          //            Seq("non-modification").toDF("linear").show(10, false)
+          //          }
 
           group += 1
         }
@@ -178,33 +166,26 @@ class DistributedSFM(override val uid: String) extends Estimator[DistributedSFMM
         while (group < $(numRandGroups)) {
           instr.log(s"iteration $iter: update factors $group")
 
-          //          val prevModel = model
-
-          val (newModel, modified) = updateFactors(instances, intercept, model,
+          val predictions = predict(flattened, intercept, model, $(rank))
+          model = updateFactors2(predictions, intercept, model, partitioner,
             $(rank), $(regFactorL1).toFloat, $(regFactorL2).toFloat, $(regFactorLG).toFloat,
             $(maxCCDIters), $(numRandGroups), group, $(seed) - iter)
+          checkpointer.update(model)
+          model.count()
 
-          if (modified) {
-            model = newModel
-//            checkpointer.update(model)
-            //            model.persist(storageLevel)
-//            model.count()
 
-            val path = s"${$(checkpointDir)}/$iter-factors-$group"
-            model.saveAsObjectFile(path)
+          //          val (newModel, modified) = updateFactors(instances, intercept, model,
+          //            $(rank), $(regFactorL1).toFloat, $(regFactorL2).toFloat, $(regFactorLG).toFloat,
+          //            $(maxCCDIters), $(numRandGroups), group, $(seed) - iter)
+          //
+          //          if (modified) {
+          //            model = newModel
+          //            checkpointer.update(model)
+          //            model.count()
+          //          } else {
+          //            Seq("non-modification").toDF("factor").show(10, false)
+          //          }
 
-            model = spark.sparkContext.objectFile[(Long, (Float, Array[Float]))](path)
-
-            //            prevModel.unpersist(false)
-
-          } else {
-            Seq("non-modification").toDF("factor").show(10, false)
-          }
-
-          model.map {
-            case (index, (linear, factor)) =>
-              (index, linear, factor)
-          }.toDF("index", "linear", "factor").sort("index").show(10, false)
 
           group += 1
         }
@@ -221,12 +202,10 @@ class DistributedSFM(override val uid: String) extends Estimator[DistributedSFMM
     finalModel.persist(StorageLevel.fromString($(finalStorageLevel)))
     finalModel.count()
 
-    //    checkpointer.unpersistDataSet()
-    //    checkpointer.deleteAllCheckpoints()
+    checkpointer.unpersistDataSet()
+    checkpointer.deleteAllCheckpoints()
 
-    if (handlePersistence) {
-      instances.unpersist(false)
-    }
+    flattened.unpersist(false)
 
     val fmm = new DistributedSFMModel(uid, intercept, finalModel)
     instr.logSuccess(fmm)
@@ -253,6 +232,7 @@ class DistributedSFM(override val uid: String) extends Estimator[DistributedSFMM
         }.max() + 1
     }
   }
+
 
   def extractInstances(dataset: Dataset[_]): RDD[(Long, Float, Float, Array[Long], Array[Float])] = {
     val spark = dataset.sparkSession
@@ -315,7 +295,6 @@ class DistributedSFM(override val uid: String) extends Estimator[DistributedSFMM
     }
   }
 
-
   override def copy(extra: ParamMap): DistributedSFM = defaultCopy(extra)
 
   override def transformSchema(schema: StructType): StructType = {
@@ -325,6 +304,39 @@ class DistributedSFM(override val uid: String) extends Estimator[DistributedSFMM
 
 
 object DistributedSFM extends Serializable {
+
+  def updateIntercept2[@spec(Float, Double) V: Fractional : ClassTag](predictions: RDD[(Long, V, V, Array[Long], Array[V], V, Array[V])],
+                                                                      intercept: V,
+                                                                      model: RDD[(Long, (V, Array[V]))],
+                                                                      rank: Int,
+                                                                      regI1: V,
+                                                                      regI2: V): V = {
+    val fracV = implicitly[Fractional[V]]
+    import fracV._
+
+    val (errorSum, weightSum) = predictions.treeAggregate((zero, zero))(
+      seqOp = {
+        case ((errorSum, weightSum), (_, instanceLabel, instanceWeight, _, _, prediction, _)) =>
+          (errorSum + (instanceLabel - prediction) * instanceWeight, weightSum + instanceWeight)
+      }, combOp = {
+        case ((errorSum1, weightSum1), (errorSum2, weightSum2)) =>
+          (errorSum1 + errorSum2, weightSum1 + weightSum2)
+      })
+
+    var a = weightSum + regI2
+    a += a
+
+    var c = errorSum + intercept * weightSum
+    c += c
+
+    if (c + regI1 < zero) {
+      (c + regI1) / a
+    } else if (c - regI1 > zero) {
+      (c - regI1) / a
+    } else {
+      zero
+    }
+  }
 
 
   /**
@@ -397,6 +409,60 @@ object DistributedSFM extends Serializable {
   }
 
 
+  def updateLinears2[@spec(Float, Double) V: Fractional : ClassTag](predictions: RDD[(Long, V, V, Array[Long], Array[V], V, Array[V])],
+                                                                    intercept: V,
+                                                                    model: RDD[(Long, (V, Array[V]))],
+                                                                    partitioner: Partitioner,
+                                                                    rank: Int,
+                                                                    regW1: V,
+                                                                    regW2: V,
+                                                                    denominator: Int,
+                                                                    remainder: Int,
+                                                                    seed: Long): RDD[(Long, (V, Array[V]))] = {
+    val fracV = implicitly[Fractional[V]]
+    import fracV._
+
+    val selector = IndicesSelector(denominator, remainder, seed)
+
+    val selectedModel = model.flatMap { case (index, (linear, _)) =>
+      if (selector.contains(index)) {
+        Iterator.single(index, linear)
+      } else {
+        Iterator.empty
+      }
+    }.partitionBy(partitioner)
+
+    val problems = predictions.flatMap { case (instanceIndex, instanceLabel, instanceWeight, indices, values, prediction, dots) =>
+      indices.iterator
+        .zip(values.iterator)
+        .filter { case (index, _) => selector.contains(index) }
+        .map { case (index, value) =>
+          (index, (instanceLabel, instanceWeight, value, prediction, dots))
+        }
+
+    }.join(selectedModel)
+
+      .map { case (index, ((instanceLabel, instanceWeight, value, prediction, _), linear)) =>
+        val y = instanceLabel - prediction + value * linear
+        (index, (instanceWeight, y, Array(value), Array(zero)))
+      }
+
+
+    val solutions = solve(problems, 1, regW1, regW2, zero, 1)
+
+    model.leftOuterJoin(solutions)
+      .map { case (index, ((linear, factor), solution)) =>
+        if (solution.nonEmpty) {
+          (index, (solution.get.head, factor))
+        } else if (selector.contains(index)) {
+          (index, (zero, factor))
+        } else {
+          (index, (linear, factor))
+        }
+      }.partitionBy(partitioner)
+  }
+
+
   /**
     * input
     * 00           instance_index   Long
@@ -425,7 +491,7 @@ object DistributedSFM extends Serializable {
 
     val selector = IndicesSelector(denominator, remainder, seed)
     val selectedModel = model.flatMap { case (index, (linear, _)) =>
-      if (selector.contain(index)) {
+      if (selector.contains(index)) {
         Iterator.single(index, linear)
       } else {
         Iterator.empty
@@ -460,6 +526,69 @@ object DistributedSFM extends Serializable {
   }
 
 
+  def updateFactors2[@spec(Float, Double) V: Fractional : ClassTag](predictions: RDD[(Long, V, V, Array[Long], Array[V], V, Array[V])],
+                                                                    intercept: V,
+                                                                    model: RDD[(Long, (V, Array[V]))],
+                                                                    partitioner: Partitioner,
+                                                                    rank: Int,
+                                                                    regV1: V,
+                                                                    regV2: V,
+                                                                    regVG: V,
+                                                                    ccdIters: Int,
+                                                                    denominator: Int,
+                                                                    remainder: Int,
+                                                                    seed: Long): RDD[(Long, (V, Array[V]))] = {
+
+    val fracV = implicitly[Fractional[V]]
+    import fracV._
+
+    val selector = IndicesSelector(denominator, remainder, seed)
+
+    val selectedModel = model.flatMap { case (index, (_, factor)) =>
+      if (selector.contains(index)) {
+        Iterator.single(index, factor)
+      } else {
+        Iterator.empty
+      }
+    }.partitionBy(partitioner)
+
+    val problems = predictions.flatMap { case (instanceIndex, instanceLabel, instanceWeight, indices, values, prediction, dots) =>
+      indices.iterator
+        .zip(values.iterator)
+        .filter { case (index, _) => selector.contains(index) }
+        .map { case (index, value) =>
+          (index, (instanceLabel, instanceWeight, value, prediction, dots))
+        }
+
+    }.join(selectedModel)
+
+      .map { case (index, ((instanceLabel, instanceWeight, value, prediction, dots), factor)) =>
+        var y = instanceLabel - prediction
+        val x = Array.fill(rank)(zero)
+        for (f <- 0 until rank) {
+          val vfl = factor(f)
+          val r = value * (dots(f) - vfl * value)
+          x(f) = r
+          y += vfl * r
+        }
+        (index, (instanceWeight, y, x, factor))
+      }
+
+
+    val solutions = solve(problems, rank, regV1, regV2, regVG, ccdIters)
+
+    model.leftOuterJoin(solutions)
+      .map { case (index, ((linear, factor), solution)) =>
+        if (solution.nonEmpty) {
+          (index, (linear, solution.get))
+        } else if (selector.contains(index)) {
+          (index, (linear, Array.empty[V]))
+        } else {
+          (index, (linear, factor))
+        }
+      }.partitionBy(partitioner)
+  }
+
   /**
     * input
     * 00           instance_index   Long
@@ -490,7 +619,7 @@ object DistributedSFM extends Serializable {
 
     val selector = IndicesSelector(denominator, remainder, seed)
     val selectedModel = model.flatMap { case (index, (_, factor)) =>
-      if (selector.contain(index)) {
+      if (selector.contains(index)) {
         Iterator.single(index, factor)
       } else {
         Iterator.empty
@@ -506,12 +635,6 @@ object DistributedSFM extends Serializable {
       import spark.implicits._
 
       val predicted = predictAndFlatten(instances, intercept, model, rank, selector)
-
-      predicted.map { case (index, (instanceLabel, instanceWeight, value, prediction, dots)) =>
-        (index, instanceLabel.toFloat(), instanceWeight.toFloat(), value.toFloat(), prediction.toFloat(), dots.map(_.toFloat()))
-      }.toDF("index", "label", "weight", "value", "prediction", "dots")
-        .sort("index")
-        .show(10, false)
 
       val problems = predicted.join(selectedModel)
         .map { case (index, ((instanceLabel, instanceWeight, value, prediction, dots), factor)) =>
@@ -543,6 +666,85 @@ object DistributedSFM extends Serializable {
   }
 
 
+  def flattenInstances[@spec(Float, Double) V: Fractional : ClassTag](instances: RDD[(Long, V, V, Array[Long], Array[V])],
+                                                                      partitioner: Partitioner): RDD[(Long, (Long, V, V, V, Array[Long], Array[V]))] = {
+    val fracV = implicitly[Fractional[V]]
+    import fracV._
+
+    instances.flatMap { case (instanceIndex, instanceLabel, instanceWeight, indices, values) =>
+      var first = true
+      indices.iterator
+        .zip(values.iterator)
+        .filter(_._2 != zero)
+        .map { case (index, value) =>
+          if (first) {
+            first = false
+            (index, (instanceIndex, instanceLabel, instanceWeight, value, indices, values))
+          } else {
+            (index, (instanceIndex, instanceLabel, instanceWeight, value, Array.emptyLongArray, Array.empty[V]))
+          }
+        }
+    }.partitionBy(partitioner)
+  }
+
+
+  /**
+    * input rdds:
+    * flattenInstances
+    * _1           index            Long
+    * _2._1        instance_index   Long
+    * _2._2        instance_label   V
+    * _2._3        instance_weight  V
+    * _2._4        value            V               xl
+    * _2._5        indices          Array[Long]     non-zero indices
+    * _2._6        values           Array[V]
+    *
+    * model
+    * _1           index            Long            feature index
+    * _2._1        linear           V
+    * _2._2        factor           Array[V]
+    *
+    */
+  def predict[@spec(Float, Double) V: Fractional : ClassTag](flattened: RDD[(Long, (Long, V, V, V, Array[Long], Array[V]))],
+                                                             intercept: V,
+                                                             model: RDD[(Long, (V, Array[V]))],
+                                                             rank: Int): RDD[(Long, V, V, Array[Long], Array[V], V, Array[V])] = {
+    val fracV = implicitly[Fractional[V]]
+    import fracV._
+
+    val negativeInfinity = -one / zero
+
+    flattened.join(model)
+
+      .map { case (_, ((instanceIndex, instanceLabel, instanceWeight, value, indices, values), (linear, factor))) =>
+        (instanceIndex, (instanceLabel, instanceWeight, value, indices, values, linear, factor))
+
+      }.aggregateByKey((new PredictWithDotsAggregator[V](rank), negativeInfinity, negativeInfinity, Array.emptyLongArray, Array.empty[V]))(
+      seqOp = {
+        case ((predAgg, instanceLabel_, instanceWeight_, indices_, values_),
+        (instanceLabel, instanceWeight, value, indices, values, linear, factor)) =>
+          (predAgg.update(value, linear, factor),
+            max(instanceLabel, instanceLabel_),
+            max(instanceWeight, instanceWeight_),
+            Seq(indices, indices_).maxBy(_.length),
+            Seq(values, values_).maxBy(_.length))
+
+      }, combOp = {
+        case ((predAgg1, instanceLabel1, instanceWeight1, indices1, values1),
+        (predAgg2, instanceLabel2, instanceWeight2, indices2, values2)) =>
+          (predAgg1.merge(predAgg2),
+            max(instanceLabel1, instanceLabel2),
+            max(instanceWeight1, instanceWeight2),
+            Seq(indices1, indices2).maxBy(_.length),
+            Seq(values1, values2).maxBy(_.length))
+
+      }).map { case (instanceIndex, (predAgg, instanceLabel, instanceWeight, indices, values)) =>
+      val (prediction, dots) = predAgg.compute(intercept)
+      (instanceIndex, instanceLabel, instanceWeight, indices, values, prediction, dots)
+    }
+  }
+
+
   /**
     * input
     * 00           instance_index   Long
@@ -567,8 +769,8 @@ object DistributedSFM extends Serializable {
 
     val negativeInfinity = -one / zero
 
-    instances.flatMap { case (instanceIndex, instanceLabel, instanceWeight, indices, values) =>
-      val selectedIndices = indices.filter(selector.contain)
+    val pred = instances.flatMap { case (instanceIndex, instanceLabel, instanceWeight, indices, values) =>
+      val selectedIndices = indices.filter(selector.contains)
 
       if (selectedIndices.nonEmpty) {
         var first = true
@@ -647,6 +849,17 @@ object DistributedSFM extends Serializable {
           }
       }
     }
+
+
+    val spark = SparkSession.builder().getOrCreate()
+    import spark.implicits._
+
+    pred.map { case (index, (instanceLabel, instanceWeight, value, prediction, dots)) =>
+      (index, instanceLabel.toFloat(), instanceWeight.toFloat(), value.toFloat(), prediction.toFloat(), dots.map(_.toFloat()))
+    }.toDF("index", "label", "weight", "value", "prediction", "dots")
+      .write.mode(SaveMode.Overwrite).parquet(s"/tmp/spark/SFM-predictAndFlatten-${System.currentTimeMillis()}")
+
+    pred
   }
 
 
@@ -663,17 +876,6 @@ object DistributedSFM extends Serializable {
                                                            regL2: V,
                                                            regLG: V,
                                                            iters: Int): RDD[(Long, Array[V])] = {
-    val fracV = implicitly[Fractional[V]]
-    import fracV._
-
-    val spark = SparkSession.builder().getOrCreate()
-    import spark.implicits._
-
-    //    problems.map { case (index, (instanceWeight, y, x, factor)) =>
-    //      (index, instanceWeight.toFloat, y.toFloat, x.map(_.toFloat), factor.map(_.toFloat))
-    //    }.toDF("index", "instanceWeight", "y", "x", "factor").sort("index").show(10, false)
-
-
     problems.aggregateByKey((new SolverAggregator[V](k), Array.empty[V]))(
       seqOp = {
         case ((solverAgg, prevSolution_), (instanceWeight, y, x, prevSolution)) =>
@@ -704,9 +906,9 @@ class PredictWithDotsAggregator[@spec(Float, Double) V: Fractional : ClassTag](v
   val dot2Sum = Array.fill(rank)(zero)
 
   def update(value: V, linear: V, factor: Array[V]): PredictWithDotsAggregator[V] = {
-    if (!fracV.equiv(value, zero)) {
-      if (!fracV.equiv(linear, zero)) {
-        linearSum = linearSum + value * linear
+    if (value != zero) {
+      if (linear != zero) {
+        linearSum += value * linear
       }
 
       if (factor.nonEmpty) {
@@ -715,8 +917,8 @@ class PredictWithDotsAggregator[@spec(Float, Double) V: Fractional : ClassTag](v
         var i = 0
         while (i < rank) {
           val s = value * factor(i)
-          dotSum(i) = dotSum(i) + s
-          dot2Sum(i) = dot2Sum(i) + s * s
+          dotSum(i) += s
+          dot2Sum(i) += s * s
           i += 1
         }
       }
@@ -726,12 +928,12 @@ class PredictWithDotsAggregator[@spec(Float, Double) V: Fractional : ClassTag](v
   }
 
   def merge(o: PredictWithDotsAggregator[V]): PredictWithDotsAggregator[V] = {
-    linearSum = linearSum + o.linearSum
+    linearSum += o.linearSum
 
     var i = 0
     while (i < rank) {
-      dotSum(i) = dotSum(i) + o.dotSum(i)
-      dot2Sum(i) = dot2Sum(i) + o.dot2Sum(i)
+      dotSum(i) += o.dotSum(i)
+      dot2Sum(i) += o.dot2Sum(i)
       i += 1
     }
 
@@ -739,10 +941,10 @@ class PredictWithDotsAggregator[@spec(Float, Double) V: Fractional : ClassTag](v
   }
 
   def compute(intercept: V): (V, Array[V]) = {
-    var pred = intercept
+    var pred = intercept + linearSum
     var i = 0
     while (i < rank) {
-      pred = pred + (dotSum(i) * dotSum(i) - dot2Sum(i)) / fracV.fromInt(2)
+      pred += (dotSum(i) * dotSum(i) - dot2Sum(i)) / fromInt(2)
       i += 1
     }
 

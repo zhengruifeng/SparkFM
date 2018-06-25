@@ -54,7 +54,7 @@ case class IndicesSelector(denominator: Int,
   require(denominator > 0)
   require(remainder >= 0 && remainder < denominator)
 
-  def contain(index: Long): Boolean = {
+  def contains(index: Long): Boolean = {
     Murmur3_x86_32.hashLong(index, seed.toInt).abs % denominator == remainder
   }
 }

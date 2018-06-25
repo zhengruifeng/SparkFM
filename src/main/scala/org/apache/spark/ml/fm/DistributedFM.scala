@@ -99,7 +99,12 @@ class DistributedFM(override val uid: String) extends Estimator[DistributedFMMod
 
     var (intercept, model) = initialize(spark, realNumFeatures)
     model = checkpointer.update(model)
-    model.sort(INDEX).show(10, false)
+
+    var iSave = 0
+    model.write.mode(SaveMode.Overwrite).parquet(s"${$(checkpointDir)}/FM-${iSave}")
+    iSave += 1
+
+    //    model.sort(INDEX).show(10, false)
 
     val instr = Instrumentation.create(this, dataset)
     instr.logParams(params: _*)
@@ -132,7 +137,10 @@ class DistributedFM(override val uid: String) extends Estimator[DistributedFMMod
             $(rank), $(regLinearL1), $(regLinearL2))
           model = checkpointer.update(model)
 
-          model.sort(INDEX).show(10, false)
+          model.write.mode(SaveMode.Overwrite).parquet(s"${$(checkpointDir)}/FM-${iSave}")
+          iSave += 1
+
+          //          model.sort(INDEX).show(10, false)
 
           group += 1
         }
@@ -158,9 +166,10 @@ class DistributedFM(override val uid: String) extends Estimator[DistributedFMMod
 
           model = checkpointer.update(model)
 
-          model.sort(INDEX).show(10, false)
+          model.write.mode(SaveMode.Overwrite).parquet(s"${$(checkpointDir)}/FM-${iSave}")
+          iSave += 1
 
-
+          //          model.sort(INDEX).show(10, false)
           group += 1
         }
 
@@ -503,7 +512,7 @@ object DistributedFM extends Serializable {
 
     val predUDAF = new predictWithDotsUDAF(rank, intercept)
 
-    input.select(INSTANCE_INDEX, INSTANCE_LABEL, INSTANCE_WEIGHT, INDICES, VALUES)
+    val pred = input.select(INSTANCE_INDEX, INSTANCE_LABEL, INSTANCE_WEIGHT, INDICES, VALUES)
       .as[(Long, Float, Float, Array[Long], Array[Float])]
       .flatMap { case (instanceIndex, instanceLabel, instanceWeight, indices, values) =>
         var first = true
@@ -565,6 +574,10 @@ object DistributedFM extends Serializable {
             }
         }
       }.toDF(INSTANCE_LABEL, INSTANCE_WEIGHT, INDEX, VALUE, PREDICTION_DOTS)
+
+    pred.write.mode(SaveMode.Overwrite).parquet(s"/tmp/spark/FM-predictAndFlatten-${System.currentTimeMillis()}")
+
+    pred
   }
 
 
@@ -585,6 +598,8 @@ object DistributedFM extends Serializable {
     import spark.implicits._
 
     //    problems.sort(INDEX).show(10, false)
+
+    problems.write.mode(SaveMode.Overwrite).parquet(s"/tmp/spark/FM-Problem-${System.currentTimeMillis()}")
 
     val statUDAF = new ProblemStatUDAF(k)
 

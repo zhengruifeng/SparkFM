@@ -16,28 +16,12 @@ class SolverAggregator[@spec(Float, Double) V: Fractional : ClassTag](k: Int) ex
   def update(w: V,
              x: Array[V],
              y: V): SolverAggregator[V] = {
-    var index = k
-    var i = 0
-    var j = 0
-    while (i < k) {
-      j = i
-      while (j < k) {
-        stat(index) += x(i) * x(j) * w
-        index += 1
-        j += 1
-      }
-      stat(i) += x(i) * y * w
-      i += 1
-    }
+    Solver.updateStat(stat, k, w, x, y)
     this
   }
 
   def merge(o: SolverAggregator[V]): SolverAggregator[V] = {
-    var i = 0
-    while (i < stat.length) {
-      stat(i) += o.stat(i)
-      i += 1
-    }
+    Solver.mergeStat(stat, o.stat)
     this
   }
 
