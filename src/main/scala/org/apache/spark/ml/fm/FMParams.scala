@@ -145,7 +145,7 @@ private[fm] trait FMParams extends Params
     *
     * @group param
     */
-  val maxCCDIters = new IntParam(this, "maxCCDIters", "maximum iterations in base CCD solver", ParamValidators.gtEq(5))
+  val maxCCDIters = new IntParam(this, "maxCCDIters", "maximum iterations in base CCD solver", ParamValidators.gtEq(3))
 
   /** @group getParam */
   def getMaxCCDIters: Int = $(maxCCDIters)
@@ -156,6 +156,7 @@ private[fm] trait FMParams extends Params
   /**
     * Param for whether to fit linear coefficients.
     * Default: true
+    *
     * @group param
     */
   final val fitLinear: BooleanParam = new BooleanParam(this, "fitLinear", "whether to fit linear coefficients")
@@ -175,6 +176,21 @@ private[fm] trait FMParams extends Params
 
   /** @group expertGetParam */
   def getInitModelPath: String = $(initModelPath)
+
+
+  /**
+    * Float precision to represent internal numerical types.
+    * (default = "float")
+    *
+    * @group param
+    */
+  final val floatType: Param[String] =
+    new Param[String](this, "floatType", "Float precision to represent internal numerical types.",
+      ParamValidators.inArray[String](Array("float", "double")))
+
+  def getFloatType: String = $(floatType)
+
+  setDefault(floatType -> "float")
 }
 
 
@@ -183,16 +199,13 @@ private[fm] trait DistributedFMParams extends FMParams
 
   /**
     * Param for number of features.
-    * Default: -1
     *
     * @group param
     */
-  val numFeatures = new LongParam(this, "numFeatures", "number of features")
+  val numFeatures = new LongParam(this, "numFeatures", "number of features", ParamValidators.gt(0))
 
   /** @group getParam */
   def getNumFeatures: Long = $(numFeatures)
-
-  setDefault(numFeatures -> -1)
 
 
   /**
@@ -235,17 +248,6 @@ private[fm] trait DistributedFMParams extends FMParams
   def getFeatureValuesCol: String = $(featureValuesCol)
 
   setDefault(featureValuesCol -> "featureValues")
-
-
-  /**
-    * Param for directory for model checkpointing.
-    *
-    * @group param
-    */
-  val checkpointDir = new Param[String](this, "checkpointDir", "directory for model checkpointing")
-
-  /** @group getParam */
-  def getCheckpointDir: String = $(checkpointDir)
 
 
   /**
